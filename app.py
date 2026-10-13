@@ -26,7 +26,10 @@
 import hashlib
 import hmac
 import json
+import html as _html
+import math
 import os
+import random
 import smtplib
 import sqlite3
 import threading
@@ -35,6 +38,7 @@ from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 
 import pandas as pd
+import pydeck as pdk
 import streamlit as st
 
 try:
@@ -86,7 +90,89 @@ PROJECT_LINKS = [
 ]
 
 
+# ───────────────────────── Топологія мережі (Power Grid Graph) ─────────────────────────
+# Підстанція 110/35 кВ → Фідер 10 кВ → ТП 10/0.4 кВ → Споживач.
+# Схема демонстраційна (синтетична): замініть SUBSTATIONS/логіку build_grid на дані вашого ГІС/SCADA.
+SUBSTATIONS = {  # id підстанції: (пункт розташування, коди пунктів, що отримують від неї живлення)
+    "PS-VIN": ("VIN", ["VIN", "TYV", "KAL"]),
+    "PS-ZHM": ("ZHM", ["ZHM", "BAR", "SHA", "MKU"]),
+    "PS-MOG": ("MOG", ["MOG", "YAM"]),
+    "PS-KHM": ("KHM", ["KHM", "KOZ", "POH"]),
+    "PS-TUL": ("TUL", ["TUL", "TOM", "KRY", "NEM"]),
+    "PS-HAI": ("HAI", ["HAI", "LAD", "BER"]),
+    "PS-LYP": ("LYP", ["LYP", "ILL"]),
+}
+NODE_TYPES = {"sub": "Підстанція 110/35 кВ", "feeder": "Фідер 10 кВ", "tp": "ТП 10/0.4 кВ"}
+LEVELS = {0: "🟢 Норма", 2: "🟠 Планові роботи", 3: "🔴 Аварія"}
+COLORS = {0: [46, 160, 67, 235], 2: [251, 140, 0, 235], 3: [229, 57, 53, 235]}
+GRID: dict = {}  # id вузла -> {id, type, name, parent, lat, lon}
+
+
+def build_grid():
+    for sid, (host, _codes) in SUBSTATIONS.items():
+        name, _r, lat, lon = SETTLEMENTS[host]
+        GRID[sid] = dict(id=sid, type="sub", name=f"ПС 110/35 кВ «{name}»", parent=None,
+                         lat=lat + 0.012, lon=lon - 0.016)
+    for sid, (_host, codes) in SUBSTATIONS.items():
+        for code in codes:
+            name, _r, lat, lon = SETTLEMENTS[code]
+            for n in (1, 2, 3):
+                lid, ang = f"{code}-{n}", math.radians(120 * n)
+                GRID[lid] = dict(id=lid, type="feeder", name=f"Фідер 10 кВ {lid} ({name})", parent=sid,
+                                 lat=lat + 0.02 * math.sin(ang), lon=lon + 0.03 * math.cos(ang))
+                for k, da in ((1, 25), (2, -25)):
+                    a2, tid = ang + math.radians(da), f"TP-{lid}-{k}"
+                    GRID[tid] = dict(id=tid, type="tp", name=f"ТП 10/0.4 кВ {lid}-{k}", parent=lid,
+                                     lat=lat + 0.035 * math.sin(a2), lon=lon + 0.052 * math.cos(a2))
+
+
+build_grid()
+
+
+def ancestors(node: str) -> list[str]:
+    """Вузол і всі вищі вузли: [ТП, фідер, підстанція]."""
+    out = []
+    while node in GRID:
+        out.append(node)
+        node = GRID[node]["parent"]
+    return out
+
+
+def descendants(node: str) -> list[str]:
+    """Вузол і всі підпорядковані вузли (у порядку «батьки перед дітьми»)."""
+    return [i for i in GRID if node in ancestors(i)]
+
+
+def tp_of(account, line: str) -> str:
+    """ТП споживача (детерміновано від № рахунку, 2 ТП на фідер)."""
+    return f"TP-{line}-{int(hashlib.md5(str(account).encode()).hexdigest(), 16) % 2 + 1}"
+
+
+def chain_ids(c) -> list[str]:
+    return ancestors(tp_of(c["account"], c["line_id"])) if c["line_id"] in GRID else [c["line_id"]]
+
+
+def node_code(node: str):
+    n = GRID.get(node)
+    if not n:
+        return None
+    return SUBSTATIONS[node][0] if n["type"] == "sub" else (node.split("-")[1] if n["type"] == "tp" else node.split("-")[0])
+
+
+def consumers_under(node: str):
+    """Усі споживачі, підпорядковані вузлу (каскад). Для невідомого вузла — за line_id."""
+    n = GRID.get(node)
+    if not n:
+        return q("SELECT * FROM consumers WHERE line_id=?", (node,))
+    lines = [n["parent"]] if n["type"] == "tp" else [i for i in descendants(node) if GRID[i]["type"] == "feeder"]
+    rows = q(f"SELECT * FROM consumers WHERE line_id IN ({','.join('?' * len(lines))})", tuple(lines))
+    return [r for r in rows if n["type"] != "tp" or tp_of(r["account"], r["line_id"]) == node]
+
+
 def line_label(line: str) -> str:
+    n = GRID.get(line)
+    if n and n["type"] != "feeder":
+        return n["name"]
     code = LINES.get(line)
     return f"{line} · {SETTLEMENTS[code][0]}" if code else line
 
@@ -237,7 +323,7 @@ def fetch_incidents(cfg: dict) -> list[dict]:
 def build_message(inc: sqlite3.Row | dict, c: sqlite3.Row) -> tuple[str, str]:
     kind, status = KINDS[inc["kind"]], STATUSES[inc["status"]]
     subj = f"{kind}: {inc['title']} ({status})"
-    body = (f"Шановний(а) {c['name']}!\n\n{kind} на вашій лінії {line_label(inc['line_id'])} "
+    body = (f"Шановний(а) {c['name']}!\n\n{kind} на ділянці мережі {line_label(inc['line_id'])} "
             f"(адреса: {c['address']}).\nСтатус: {status}\n"
             f"Початок: {fmt_dt(inc['starts_at'])}\nОрієнтовне завершення: {fmt_dt(inc['ends_at'])}\n"
             f"{inc['description'] or ''}\n\nОстаннє оновлення: {fmt_dt(inc['updated_at'])}")
@@ -270,8 +356,8 @@ def send_telegram(cfg, chat, subj, body) -> str:
 def notify_for(cfg, inc: dict):
     """Сповістити всіх споживачів лінії; дедуплікація через UNIQUE у notif_log."""
     event_key = f"{inc['status']}:{inc['updated_at']}"
+    consumers = consumers_under(inc["line_id"])  # каскад: усі споживачі нижче вузла аварії
     with DB_LOCK, db() as con:
-        consumers = con.execute("SELECT * FROM consumers WHERE line_id=?", (inc["line_id"],)).fetchall()
         for c in consumers:
             subj, body = build_message(inc, c)
             channels = [("email", c["ch_email"], lambda: send_email(cfg, c["email"], subj, body)),
@@ -342,7 +428,7 @@ def incident_cards(rows):
         box(f"**{KINDS[r['kind']]} — {r['title']}**  \n"
             f"Статус: **{STATUSES[r['status']]}** · Початок: {fmt_dt(r['starts_at'])} · "
             f"Завершення: {fmt_dt(r['ends_at'])}  \n{r['description'] or ''}  \n"
-            f"_Оновлено: {fmt_dt(r['updated_at'])}_")
+            f"📍 {line_label(r['line_id'])} · _Оновлено: {fmt_dt(r['updated_at'])}_")
 
 
 def q(sql, params=()):
@@ -414,9 +500,13 @@ def consumer_portal():
     c = rows[0]
     code = LINES.get(c["line_id"])
     raion = SETTLEMENTS[code][1] if code else "—"
+    chain = chain_ids(c)
+    ph = ",".join("?" * len(chain))
     h1, h2 = st.columns([5, 1])
     h1.markdown(f"#### 👤 {c['name']}")
     h1.caption(f"Рахунок {c['account']} · {c['address']} · {raion} район · лінія {line_label(c['line_id'])}")
+    if c["line_id"] in GRID:
+        h1.caption("🔌 Живлення: " + " ← ".join(GRID[i]["name"] for i in chain) + " · Споживач")
     if h2.button("Вийти"):
         del st.session_state["consumer_id"]
         st.rerun()
@@ -427,8 +517,8 @@ def consumer_portal():
     with tabs[0]:
         @st.fragment(run_every=5)
         def live():
-            ev = q("SELECT * FROM incidents WHERE line_id=? AND status!='resolved' "
-                   "ORDER BY (kind='outage') DESC, updated_at DESC", (c["line_id"],))
+            ev = q(f"SELECT * FROM incidents WHERE line_id IN ({ph}) AND status!='resolved' "
+                   "ORDER BY (kind='outage') DESC, updated_at DESC", tuple(chain))
             active = [r for r in ev if r["status"] == "active"]
             plan = [r for r in ev if r["status"] == "scheduled"]
             k1, k2, k3 = st.columns(3)
@@ -442,8 +532,8 @@ def consumer_portal():
         live()
 
     with tabs[1]:
-        plan = q("SELECT * FROM incidents WHERE line_id=? AND kind='planned' AND status='scheduled' "
-                 "ORDER BY starts_at", (c["line_id"],))
+        plan = q(f"SELECT * FROM incidents WHERE line_id IN ({ph}) AND kind='planned' AND status='scheduled' "
+                 "ORDER BY starts_at", tuple(chain))
         st.markdown("**Заплановані роботи на вашій лінії**")
         if plan:
             st.dataframe(pd.DataFrame([{"Робота": r["title"], "Початок": fmt_dt(r["starts_at"]),
@@ -466,7 +556,7 @@ def consumer_portal():
                 st.caption("На інших лініях вашого населеного пункту подій немає.")
 
     with tabs[2]:
-        hist = q("SELECT * FROM incidents WHERE line_id=? ORDER BY updated_at DESC", (c["line_id"],))
+        hist = q(f"SELECT * FROM incidents WHERE line_id IN ({ph}) ORDER BY updated_at DESC", tuple(chain))
         m1, m2, m3 = st.columns(3)
         m1.metric("Усього подій", len(hist))
         m2.metric("Аварій", sum(r["kind"] == "outage" for r in hist))
@@ -584,8 +674,8 @@ def admin_panel(cfg):
         return
     if cfg["ADMIN_PASSWORD"] == ADMIN_PASSWORD:
         st.warning("Пароль вшито в код — для безпеки задайте ADMIN_PASSWORD у secrets.")
-    t1, t2, t3, t4, t5 = st.tabs(["📡 Моніторинг", "👥 Споживачі", "📨 Журнал сповіщень", "🧪 Симулятор",
-                                   "📝 Звернення"])
+    t1, t2, t3, t4, t5, t6, t7 = st.tabs(["📡 Моніторинг", "👥 Споживачі", "📨 Журнал сповіщень", "🧪 Симулятор",
+                                          "📝 Звернення", "🗺️ GIS-аналітика", "🕸️ Топологія"])
 
     with t1:
         c1, c2 = st.columns([1, 3])
@@ -638,7 +728,7 @@ def admin_panel(cfg):
             st.info("Симулятор доступний лише в демо-режимі.")
         else:
             sim = get_simulator()
-            line = st.selectbox("Лінія", list(LINES), format_func=line_label)
+            line = node_picker("sim")
             kind = st.radio("Тип", list(KINDS), format_func=KINDS.get, horizontal=True)
             title = st.text_input("Заголовок", "Пошкодження кабелю")
             hours = st.slider("Тривалість, год", 1, 12, 4)
@@ -653,10 +743,21 @@ def admin_panel(cfg):
             if rid and st.button("✅ Позначити усуненою"):
                 sim.resolve(rid)
                 st.success("Статус оновлено")
+            st.divider()
+            st.markdown("**Хвиля скарг споживачів** (для теплової карти) — навколо вузла, обраного вище")
+            nwave = st.slider("Кількість скарг", 5, 80, 40, key="wave_n")
+            w1, w2 = st.columns(2)
+            if w1.button("📣 Згенерувати скарги"):
+                st.success(f"Додано скарг: {gen_complaints(line, nwave)}")
+            if w2.button("🧹 Видалити демо-скарги"):
+                with DB_LOCK, db() as con:
+                    con.execute("DELETE FROM reports WHERE consumer_id=0")
+                st.success("Демо-скарги видалено")
 
     with t5:
-        df = qdf("SELECT r.id, r.ts, c.account, c.name, r.line_id, r.category, r.text, r.status FROM reports r "
-                 "JOIN consumers c ON c.id=r.consumer_id ORDER BY r.id DESC LIMIT 200")
+        df = qdf("SELECT r.id, r.ts, COALESCE(c.account,'—') AS account, COALESCE(c.name,'Демо-абонент') AS name, "
+                 "r.line_id, r.category, r.text, r.status FROM reports r "
+                 "LEFT JOIN consumers c ON c.id=r.consumer_id ORDER BY r.id DESC LIMIT 200")
         if df.empty:
             st.info("Звернень поки немає.")
         else:
@@ -670,30 +771,255 @@ def admin_panel(cfg):
                     con.execute("UPDATE reports SET status=? WHERE id=?", (new, int(rid)))
                 st.rerun()
 
+    with t6:
+        g1, g2, g3 = st.columns(3)
+        hours = g1.slider("Вікно скарг, год", 1, 24, 3)
+        thr = g2.slider("Поріг кластера (скарг на фідер)", 2, 30, 4)
+        closed = g3.checkbox("Враховувати закриті звернення", False)
+        opts = st.multiselect("Шари карти", ["Підстанції 110/35 кВ", "Лінії (підстанція→фідер→ТП)", "ТП 0.4 кВ",
+                                             "Теплова карта скарг"],
+                              default=["Підстанції 110/35 кВ", "Теплова карта скарг"], key="gis_layers")
+        res = grid_states()
+        pts = complaint_points(hours, closed)
+        st.pydeck_chart(network_map(res, settlement_states(res), subs="Підстанції 110/35 кВ" in opts,
+                                    edges="Лінії (підстанція→фідер→ТП)" in opts, tps="ТП 0.4 кВ" in opts,
+                                    heat=pts if "Теплова карта скарг" in opts else None),
+                        use_container_width=True)
+        st.caption(f"Скарг у вікні {hours} год: **{len(pts)}** · 🟢 норма · 🟠 планові роботи · 🔴 аварія · "
+                   "тепла пляма — концентрація скарг")
+        clusters, warns = complaint_clusters(pts, res, thr)
+        for w in warns:
+            st.error(w)
+        if clusters.empty:
+            st.info("Скарг у вибраному вікні немає. Згенеруйте їх у вкладці «Симулятор».")
+        else:
+            st.markdown("**Кластери скарг за фідерами**")
+            st.dataframe(clusters, use_container_width=True, hide_index=True)
+
+    with t7:
+        res = grid_states()
+        sub = st.selectbox("Підстанція", list(SUBSTATIONS), format_func=lambda i: GRID[i]["name"], key="topo_sub")
+        st.graphviz_chart(grid_dot(sub, res), use_container_width=True)
+        st.caption("🟢 норма · 🟠 планові роботи · 🔴 аварія/знеструмлення · пунктир — стан успадковано від вищого вузла (каскад)")
+        st.divider()
+        st.markdown("**Моделювання каскадного відключення (what-if)**")
+        node = node_picker("wi")
+        rep_ = cascade_report(node)
+        k1, k2, k3 = st.columns(3)
+        k1.metric("Фідерів без напруги", len(rep_["feeders"]))
+        k2.metric("ТП без напруги", len(rep_["tps"]))
+        k3.metric("Споживачів у реєстрі", len(rep_["consumers"]))
+        if rep_["consumers"]:
+            st.dataframe(pd.DataFrame([{"Рахунок": r["account"], "ПІБ": r["name"], "Адреса": r["address"],
+                                        "ТП": GRID[tp_of(r["account"], r["line_id"])]["name"]}
+                                       for r in rep_["consumers"]]), use_container_width=True, hide_index=True)
+        if cfg["DEMO"] and st.button("⚡ Створити аварію на цьому вузлі (симулятор)"):
+            now = datetime.now(timezone.utc)
+            get_simulator().add("outage", node, f"Аварія: {GRID[node]['name']}", "Створено з розділу «Топологія».",
+                                now, now + timedelta(hours=4), "active")
+            st.success("Створено — буде підхоплено при наступному опитуванні (або натисніть «Опитати зараз»)")
+
+
+def inc_level(r) -> int:
+    return 3 if (r["kind"] == "outage" and r["status"] == "active") else 2
+
+
+def grid_states(rows=None) -> dict:
+    """Стан кожного вузла з каскадом: подія на вищому вузлі успадковується всіма нижчими."""
+    if rows is None:
+        rows = q("SELECT * FROM incidents WHERE status!='resolved'")
+    by_node = {}
+    for r in rows:
+        by_node.setdefault(r["line_id"], []).append(r)
+    res = {}
+    for nid, n in GRID.items():
+        own = by_node.get(nid, [])
+        lvl = max((inc_level(r) for r in own), default=0)
+        dark = any(r["status"] == "active" for r in own)
+        top = max(own, key=inc_level) if own else None
+        cause, src, inh = (top["title"] if top else None), (nid if own else None), False
+        p = res.get(n["parent"])
+        if p and (p["level"] > lvl or (p["dark"] and not dark)):
+            lvl, dark, cause, src, inh = max(lvl, p["level"]), dark or p["dark"], p["cause"], p["src"], True
+        res[nid] = dict(level=lvl, dark=dark, cause=cause, src=src, inherited=inh)
+    return res
+
+
+def settlement_states(res: dict) -> dict:
+    counts = {}
+    for r in q("SELECT line_id, COUNT(*) AS n FROM consumers GROUP BY line_id"):
+        code = LINES.get(r["line_id"])
+        if code:
+            counts[code] = counts.get(code, 0) + r["n"]
+    out = {}
+    for code in SETTLEMENTS:
+        tps = [i for i in GRID if i.startswith(f"TP-{code}-")]
+        out[code] = dict(level=max(res[i]["level"] for i in tps), tp_total=len(tps),
+                         tp_dark=sum(res[i]["dark"] for i in tps), consumers=counts.get(code, 0))
+    return out
+
+
+def state_text(s: dict) -> str:
+    t = LEVELS[s["level"]] + (" · знеструмлено" if s["dark"] else "")
+    if s["cause"]:
+        t += "<br/>Причина: " + _html.escape(str(s["cause"])) + (" (каскад від вищого вузла)" if s["inherited"] else "")
+    return t
+
+
+def network_map(res, sst, subs=False, edges=False, tps=False, heat=None, zoom=7.2) -> pdk.Deck:
+    layers = []
+    if heat is not None and not heat.empty:
+        layers.append(pdk.Layer("HeatmapLayer", data=heat, get_position="[lon, lat]", get_weight="weight",
+                                radius_pixels=55, intensity=2, threshold=0.03, aggregation='"SUM"'))
+    if edges:
+        data = []
+        for nid, n in GRID.items():
+            if n["parent"]:
+                par, s = GRID[n["parent"]], res[nid]
+                col = COLORS[3] if s["dark"] else COLORS[2] if s["level"] == 2 else [120, 130, 140, 120]
+                data.append(dict(slon=par["lon"], slat=par["lat"], dlon=n["lon"], dlat=n["lat"], color=col))
+        layers.append(pdk.Layer("LineLayer", data=pd.DataFrame(data), get_source_position="[slon, slat]",
+                                get_target_position="[dlon, dlat]", get_color="color", get_width=2,
+                                width_min_pixels=1))
+    layers.append(pdk.Layer(
+        "ScatterplotLayer", pickable=True, stroked=True, get_position="[lon, lat]", get_fill_color="color",
+        get_line_color=[255, 255, 255], line_width_min_pixels=2, radius_min_pixels=7, radius_max_pixels=20,
+        get_radius="radius",
+        data=pd.DataFrame([dict(
+            lon=v[3], lat=v[2], radius=3500, color=COLORS[sst[c]["level"]],
+            tip=f"<b>{v[0]}</b> ({v[1]} р-н)<br/>{LEVELS[sst[c]['level']]}<br/>"
+                f"Знеструмлено ТП: {sst[c]['tp_dark']}/{sst[c]['tp_total']}<br/>Споживачів у реєстрі: {sst[c]['consumers']}")
+            for c, v in SETTLEMENTS.items()])))
+    if tps:
+        layers.append(pdk.Layer(
+            "ScatterplotLayer", pickable=True, get_position="[lon, lat]", get_fill_color="color", get_radius=400,
+            radius_min_pixels=3, radius_max_pixels=8,
+            data=pd.DataFrame([dict(lon=n["lon"], lat=n["lat"], color=COLORS[res[i]["level"]],
+                                    tip=f"<b>{n['name']}</b><br/>{state_text(res[i])}")
+                               for i, n in GRID.items() if n["type"] == "tp"])))
+    if subs:
+        layers.append(pdk.Layer(
+            "ScatterplotLayer", pickable=True, stroked=True, get_position="[lon, lat]", get_fill_color="color",
+            get_line_color=[20, 20, 20], line_width_min_pixels=3, get_radius=5000, radius_min_pixels=11,
+            radius_max_pixels=26,
+            data=pd.DataFrame([dict(lon=n["lon"], lat=n["lat"], color=COLORS[res[i]["level"]],
+                                    tip=f"<b>{n['name']}</b><br/>{state_text(res[i])}")
+                               for i, n in GRID.items() if n["type"] == "sub"])))
+    return pdk.Deck(layers=layers, map_style="light", tooltip={"html": "{tip}"},
+                    initial_view_state=pdk.ViewState(latitude=49.05, longitude=28.5, zoom=zoom, pitch=0))
+
+
+def node_picker(key: str) -> str:
+    t = st.radio("Рівень вузла", list(NODE_TYPES), format_func=NODE_TYPES.get, horizontal=True, key=f"{key}_t")
+    ids = [i for i, n in GRID.items() if n["type"] == t]
+    return st.selectbox("Вузол", ids, format_func=lambda i: GRID[i]["name"], key=f"{key}_n")
+
+
+def cascade_report(node: str) -> dict:
+    ds = descendants(node)
+    return dict(feeders=[i for i in ds if GRID[i]["type"] == "feeder"],
+                tps=[i for i in ds if GRID[i]["type"] == "tp"], consumers=consumers_under(node))
+
+
+def complaint_points(hours: int, include_closed: bool = False) -> pd.DataFrame:
+    since = (datetime.now(timezone.utc) - timedelta(hours=hours)).replace(microsecond=0).isoformat()
+    rows = q("SELECT r.id, r.line_id, c.account, c.line_id AS cline FROM reports r "
+             "LEFT JOIN consumers c ON c.id=r.consumer_id WHERE r.ts>? "
+             + ("" if include_closed else "AND r.status!='closed'"), (since,))
+    pts = []
+    for r in rows:
+        if r["account"] and r["cline"] in GRID:
+            node = tp_of(r["account"], r["cline"])
+        elif r["line_id"] in GRID:
+            node = r["line_id"]
+        else:
+            continue
+        n = GRID[node]
+        j = [(int(hashlib.md5(f"{r['id']}{k}".encode()).hexdigest()[:6], 16) % 1000) / 1000 - 0.5 for k in "ab"]
+        feeder = node if n["type"] == "feeder" else (n["parent"] if n["type"] == "tp" else None)
+        pts.append(dict(lat=n["lat"] + j[0] * 0.008, lon=n["lon"] + j[1] * 0.012, weight=1, feeder=feeder))
+    return pd.DataFrame(pts, columns=["lat", "lon", "weight", "feeder"])
+
+
+def complaint_clusters(pts: pd.DataFrame, res: dict, thr: int):
+    if pts.empty or pts["feeder"].dropna().empty:
+        return pd.DataFrame(), []
+    cnt = pts.groupby("feeder").size().sort_values(ascending=False)
+    rows, flagged = [], {}
+    for f, n in cnt.items():
+        lvl = res[f]["level"]
+        if n >= thr and lvl == 0:
+            flagged.setdefault(GRID[f]["parent"], []).append(f)
+        rows.append({"Фідер": GRID[f]["name"], "Скарг": int(n), "Стан у системі": LEVELS[lvl],
+                     "Оцінка": "⚠️ Імовірна незареєстрована аварія" if n >= thr and lvl == 0
+                     else "✅ Збігається із зареєстрованою подією" if n >= thr else "Спостереження"})
+    warns = [f"🚨 Скарги з {len(fs)} фідерів під {GRID[sb]['name']} — імовірна аварія на підстанції, перевірте її."
+             for sb, fs in flagged.items() if len(fs) >= 2]
+    return pd.DataFrame(rows), warns
+
+
+def gen_complaints(node: str, n: int) -> int:
+    tps = [i for i in descendants(node) if GRID[i]["type"] == "tp"]
+    if not tps:
+        return 0
+    now = datetime.now(timezone.utc)
+    with DB_LOCK, db() as con:
+        for _ in range(n):
+            ts = (now - timedelta(minutes=random.randint(0, 30))).replace(microsecond=0).isoformat()
+            con.execute("INSERT INTO reports(ts,consumer_id,line_id,category,text) VALUES(?,?,?,?,?)",
+                        (ts, 0, random.choice(tps), REPORT_CATEGORIES[0], "Демо-скарга (симулятор)"))
+    return n
+
+
+def grid_dot(sub_id: str, res: dict) -> str:
+    col = {0: "#2ea043", 2: "#fb8c00", 3: "#e53935"}
+    out = ["digraph G {", '  rankdir=LR; bgcolor="transparent";',
+           '  node [shape=box, fontname="Helvetica", fontsize=10, fontcolor="white", color="#555555"];',
+           '  edge [color="#8b949e"];']
+    for nid in descendants(sub_id):
+        n, st_ = GRID[nid], res[nid]
+        label = {"sub": n["name"], "feeder": f"Фідер {nid}", "tp": f"ТП {nid[3:]}"}[n["type"]]
+        if st_["dark"]:
+            label += "\\n⚡ знеструмлено"
+        style = "rounded,filled,dashed" if st_["inherited"] else "rounded,filled"
+        out.append(f'  "{nid}" [label="{label}", fillcolor="{col[st_["level"]]}", style="{style}"];')
+        if n["parent"]:
+            out.append(f'  "{n["parent"]}" -> "{nid}" [color="{"#e53935" if st_["dark"] else "#8b949e"}"];')
+    for c in consumers_under(sub_id):
+        tp = tp_of(c["account"], c["line_id"])
+        nm = str(c["name"]).replace('"', "'")
+        out.append(f'  "C{c["account"]}" [label="👤 {nm}", shape=ellipse, style="filled", '
+                   f'fillcolor="{col[res[tp]["level"]]}"];')
+        out.append(f'  "{tp}" -> "C{c["account"]}";')
+    out.append("}")
+    return "\n".join(out)
+
 
 def oblast_map():
-    st.subheader("Карта подій по Вінницькій області")
+    st.subheader("Карта мережі Вінницької області")
 
     @st.fragment(run_every=10)
     def live():
-        with DB_LOCK, db() as con:
-            rows = con.execute("SELECT * FROM incidents WHERE status!='resolved'").fetchall()
-        base = pd.DataFrame([{"lat": v[2], "lon": v[3], "color": "#4a90d9", "size": 600}
-                             for v in SETTLEMENTS.values()])
-        ev = pd.DataFrame([{"lat": SETTLEMENTS[LINES[r["line_id"]]][2], "lon": SETTLEMENTS[LINES[r["line_id"]]][3],
-                            "color": "#e53935" if r["kind"] == "outage" else "#fb8c00", "size": 1800}
-                           for r in rows if r["line_id"] in LINES])
-        m1, m2, m3 = st.columns(3)
+        rows = q("SELECT * FROM incidents WHERE status!='resolved'")
+        res = grid_states(rows)
+        sst = settlement_states(res)
+        tp_ids = [i for i, n in GRID.items() if n["type"] == "tp"]
+        m1, m2, m3, m4 = st.columns(4)
         m1.metric("Активні аварії", sum(r["kind"] == "outage" and r["status"] == "active" for r in rows))
-        m2.metric("Заплановані ремонти", sum(r["kind"] == "planned" for r in rows))
-        with DB_LOCK, db() as con:
-            m3.metric("Споживачів у реєстрі", con.execute("SELECT COUNT(*) FROM consumers").fetchone()[0])
-        st.map(pd.concat([base, ev]), latitude="lat", longitude="lon", color="color", size="size", zoom=7)
-        st.caption("🔵 населені пункти · 🔴 аварія · 🟠 плановий ремонт")
+        m2.metric("Планові роботи", sum(r["kind"] == "planned" for r in rows))
+        m3.metric("Пункти в нормі", f"{sum(v['level'] == 0 for v in sst.values())}/{len(sst)}")
+        m4.metric("ТП без напруги", f"{sum(res[i]['dark'] for i in tp_ids)}/{len(tp_ids)}")
+        opts = st.multiselect("Шари", ["Підстанції 110/35 кВ", "Лінії (підстанція→фідер→ТП)", "ТП 0.4 кВ"],
+                              default=["Підстанції 110/35 кВ"], key="pub_layers")
+        st.pydeck_chart(network_map(res, sst, subs="Підстанції 110/35 кВ" in opts,
+                                    edges="Лінії (підстанція→фідер→ТП)" in opts, tps="ТП 0.4 кВ" in opts),
+                        use_container_width=True)
+        st.caption("🟢 норма · 🟠 планові ремонти · 🔴 аварія. Наведіть курсор на маркер, щоб побачити деталі. "
+                   "Аварія на підстанції чи фідері каскадно позначає всі підпорядковані ТП і пункти.")
         if rows:
             st.dataframe(pd.DataFrame([{
-                "Район": SETTLEMENTS[LINES[r["line_id"]]][1] if r["line_id"] in LINES else "—",
-                "Лінія": line_label(r["line_id"]), "Тип": KINDS[r["kind"]], "Подія": r["title"],
+                "Район": SETTLEMENTS[node_code(r["line_id"])][1] if node_code(r["line_id"]) else "—",
+                "Вузол мережі": line_label(r["line_id"]), "Тип": KINDS[r["kind"]], "Подія": r["title"],
                 "Статус": STATUSES[r["status"]], "Початок": fmt_dt(r["starts_at"])} for r in rows]),
                 use_container_width=True, hide_index=True)
 
