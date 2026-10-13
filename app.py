@@ -393,13 +393,16 @@ def admin_panel(cfg):
     if not st.session_state.get("admin"):
         pw = st.text_input("Пароль адміністратора", type="password")
         if st.button("Увійти"):
-            if hmac.compare_digest(pw, str(cfg["ADMIN_PASSWORD"])):
+            if hmac.compare_digest(pw.strip().encode(), str(cfg["ADMIN_PASSWORD"]).strip().encode()):
                 st.session_state.admin = True
                 st.rerun()
             time.sleep(1)
             st.error("Невірний пароль")
         if cfg["ADMIN_PASSWORD"] == ADMIN_PASSWORD:
             st.caption(f"Демо: пароль диспетчера {ADMIN_PASSWORD} (англійська розкладка, регістр важливий)")
+            if st.button("⚡ Швидкий вхід (демо)"):
+                st.session_state.admin = True
+                st.rerun()
         return
     if cfg["ADMIN_PASSWORD"] == ADMIN_PASSWORD:
         st.warning("Пароль вшито в код — для безпеки задайте ADMIN_PASSWORD у secrets.")
