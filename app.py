@@ -26,6 +26,7 @@
 import hashlib
 import hmac
 import json
+import functools
 import html as _html
 import math
 import os
@@ -40,6 +41,13 @@ from email.message import EmailMessage
 import pandas as pd
 import pydeck as pdk
 import streamlit as st
+
+try:
+    import plotly.express as px
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+except ImportError:  # графіки надійності потребують plotly
+    px = go = make_subplots = None
 
 try:
     import requests
@@ -123,7 +131,9 @@ def build_grid():
                 for k, da in ((1, 25), (2, -25)):
                     a2, tid = ang + math.radians(da), f"TP-{lid}-{k}"
                     GRID[tid] = dict(id=tid, type="tp", name=f"ТП 10/0.4 кВ {lid}-{k}", parent=lid,
-                                     lat=lat + 0.035 * math.sin(a2), lon=lon + 0.052 * math.cos(a2))
+                                     lat=lat + 0.035 * math.sin(a2), lon=lon + 0.052 * math.cos(a2),
+                                     # кількість абонентів на ТП — модель (120–400); замініть даними білінгу
+                                     customers=120 + int(hashlib.md5(tid.encode()).hexdigest()[:6], 16) % 281)
 
 
 build_grid()
@@ -220,6 +230,9 @@ def init_db():
         CREATE TABLE IF NOT EXISTS reports(
             id INTEGER PRIMARY KEY, ts TEXT, consumer_id INT, line_id TEXT, category TEXT,
             text TEXT, status TEXT DEFAULT 'new');
+        CREATE TABLE IF NOT EXISTS interruptions(
+            id INTEGER PRIMARY KEY, incident_id TEXT, node_id TEXT, kind TEXT, start_ts TEXT,
+            end_ts TEXT, cause TEXT, synthetic INT DEFAULT 0);
         CREATE TABLE IF NOT EXISTS poll_log(
             id INTEGER PRIMARY KEY, ts TEXT, ok INT, message TEXT);
         """)
@@ -258,6 +271,12 @@ class Simulator:
                 starts_at=start.replace(microsecond=0).isoformat(),
                 ends_at=end.replace(microsecond=0).isoformat() if end else None,
                 status=status, updated_at=now_iso())
+
+    def start(self, iid):
+        with self.lock:
+            inc = self.incidents.get(iid)
+            if inc and inc["status"] == "scheduled":
+                inc.update(status="active", starts_at=now_iso(), updated_at=now_iso())
 
     def resolve(self, iid):
         with self.lock:
@@ -394,6 +413,7 @@ def poll_once(cfg) -> str:
                     con.execute("INSERT OR REPLACE INTO incidents VALUES(:id,:line_id,:kind,:title,:description,"
                                 ":starts_at,:ends_at,:status,:updated_at)", inc)
                 changed += 1
+                track_interruption(inc)
                 notify_for(cfg, inc)
         msg, ok = f"Отримано {len(incidents)}, змінено {changed}", 1
     except Exception as e:
@@ -674,8 +694,9 @@ def admin_panel(cfg):
         return
     if cfg["ADMIN_PASSWORD"] == ADMIN_PASSWORD:
         st.warning("Пароль вшито в код — для безпеки задайте ADMIN_PASSWORD у secrets.")
-    t1, t2, t3, t4, t5, t6, t7 = st.tabs(["📡 Моніторинг", "👥 Споживачі", "📨 Журнал сповіщень", "🧪 Симулятор",
-                                          "📝 Звернення", "🗺️ GIS-аналітика", "🕸️ Топологія"])
+    t1, t2, t3, t4, t5, t6, t7, t8 = st.tabs(["📡 Моніторинг", "👥 Споживачі", "📨 Журнал сповіщень", "🧪 Симулятор",
+                                              "📝 Звернення", "🗺️ GIS-аналітика", "🕸️ Топологія",
+                                              "📈 Надійність"])
 
     with t1:
         c1, c2 = st.columns([1, 3])
@@ -743,6 +764,11 @@ def admin_panel(cfg):
             if rid and st.button("✅ Позначити усуненою"):
                 sim.resolve(rid)
                 st.success("Статус оновлено")
+            sched = [i for i, v in sim.incidents.items() if v["status"] == "scheduled"]
+            sch_id = st.selectbox("Розпочати заплановані роботи", [""] + sched)
+            if sch_id and st.button("▶️ Розпочати роботи"):
+                sim.start(sch_id)
+                st.success("Роботи розпочато — відключення буде враховано в SAIDI/SAIFI")
             st.divider()
             st.markdown("**Хвиля скарг споживачів** (для теплової карти) — навколо вузла, обраного вище")
             nwave = st.slider("Кількість скарг", 5, 80, 40, key="wave_n")
@@ -818,6 +844,9 @@ def admin_panel(cfg):
             get_simulator().add("outage", node, f"Аварія: {GRID[node]['name']}", "Створено з розділу «Топологія».",
                                 now, now + timedelta(hours=4), "active")
             st.success("Створено — буде підхоплено при наступному опитуванні (або натисніть «Опитати зараз»)")
+
+    with t8:
+        reliability_tab(cfg)
 
 
 def inc_level(r) -> int:
@@ -995,6 +1024,267 @@ def grid_dot(sub_id: str, res: dict) -> str:
     return "\n".join(out)
 
 
+# ───────────────────────── Надійність електропостачання (SAIFI / SAIDI / CAIDI) ─────────────────────────
+RAIONS = sorted({v[1] for v in SETTLEMENTS.values()})
+KIND_LABELS = {"outage": "Аварійне", "planned": "Планове"}
+TYPE_FILTERS = {"Аварійні (незаплановані)": ("outage",), "Планові": ("planned",), "Усі": ("outage", "planned")}
+CAUSES = ["Пошкодження повітряної лінії", "Зношення обладнання", "Грозові/погодні умови",
+          "Пошкодження кабелю", "Перевантаження", "Збій релейного захисту"]
+
+
+def pdt(v):
+    try:
+        d = datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+    except Exception:
+        return None
+    return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+
+
+def iso_utc(d: datetime) -> str:
+    return d.astimezone(timezone.utc).replace(microsecond=0).isoformat()
+
+
+@functools.lru_cache(maxsize=None)
+def tps_under(node: str) -> tuple:
+    return tuple(i for i in descendants(node) if GRID[i]["type"] == "tp")
+
+
+def tp_raion(tp: str) -> str:
+    return SETTLEMENTS[node_code(tp)][1]
+
+
+def customers_total(raion=None) -> int:
+    return sum(g["customers"] for i, g in GRID.items() if g["type"] == "tp" and (raion is None or tp_raion(i) == raion))
+
+
+def track_interruption(inc: dict):
+    """Фіксує фактичні відключення (початок/відновлення) для обчислення індексів надійності."""
+    st_dt, up_dt = pdt(inc.get("starts_at")), pdt(inc["updated_at"]) or datetime.now(timezone.utc)
+    with DB_LOCK, db() as con:
+        last = con.execute("SELECT id, end_ts FROM interruptions WHERE incident_id=? AND synthetic=0 "
+                           "ORDER BY id DESC LIMIT 1", (inc["id"],)).fetchone()
+        if inc["status"] == "active" and (not last or last["end_ts"]):
+            begin = st_dt if st_dt and st_dt <= up_dt else up_dt
+            con.execute("INSERT INTO interruptions(incident_id,node_id,kind,start_ts,end_ts,cause) VALUES(?,?,?,?,NULL,?)",
+                        (inc["id"], inc["line_id"], inc["kind"], iso_utc(begin), inc["title"]))
+        elif inc["status"] == "resolved":
+            if last and not last["end_ts"]:
+                con.execute("UPDATE interruptions SET end_ts=? WHERE id=?", (iso_utc(up_dt), last["id"]))
+            elif not last and st_dt and st_dt < up_dt:
+                con.execute("INSERT INTO interruptions(incident_id,node_id,kind,start_ts,end_ts,cause) VALUES(?,?,?,?,?,?)",
+                            (inc["id"], inc["line_id"], inc["kind"], iso_utc(st_dt), iso_utc(up_dt), inc["title"]))
+
+
+def seed_history(days: int = 90, n: int = 220, seed: int = 42) -> int:
+    """Демо-історія відключень: «слабкі» фідери, пара штормових днів, планові роботи."""
+    rng = random.Random(seed)
+    feeders = [i for i, g in GRID.items() if g["type"] == "feeder"]
+    weak = set(rng.sample(feeders, 8))
+    weights = [8 if f in weak else 1 for f in feeders]
+    now = datetime.now(timezone.utc)
+    recs = []
+
+    def add(node, kind, start, dur, cause):
+        if start + timedelta(minutes=dur) > now:
+            start = now - timedelta(minutes=dur + 1)
+        recs.append((f"HIST-{len(recs) + 1:04d}", node, kind, iso_utc(start),
+                     iso_utc(start + timedelta(minutes=dur)), cause, 1))
+
+    for _ in range(n):
+        start = now - timedelta(seconds=rng.uniform(3600, days * 86400))
+        f, r, planned = rng.choices(feeders, weights)[0], rng.random(), rng.random() < 0.15
+        node = (rng.choice(list(SUBSTATIONS)) if r < 0.04 and not planned
+                else rng.choice(tps_under(f)) if r < 0.20 else f)
+        if planned:
+            add(node, "planned", start.replace(hour=rng.randint(8, 11), minute=0),
+                rng.choice([120, 180, 240, 300, 360]) + rng.randint(-20, 20), "Плановий ремонт обладнання")
+        else:
+            cause = rng.choice(CAUSES[:2]) if f in weak else rng.choices(CAUSES, [30, 25, 15, 12, 10, 8])[0]
+            add(node, "outage", start, min(max(rng.lognormvariate(math.log(80), 0.8), 4), 720), cause)
+    for _ in range(2):  # шторм у районі
+        day, raion = now - timedelta(days=rng.randint(3, days - 1)), rng.choice(RAIONS)
+        fs = [f for f in feeders if SETTLEMENTS[f.split("-")[0]][1] == raion]
+        for f in rng.sample(fs, min(len(fs), rng.randint(5, 9))):
+            add(f, "outage", day.replace(hour=rng.randint(14, 19), minute=rng.randint(0, 59)),
+                rng.randint(40, 300), "Грозові/погодні умови")
+    with DB_LOCK, db() as con:
+        con.execute("DELETE FROM interruptions WHERE synthetic=1")
+        con.executemany("INSERT INTO interruptions(incident_id,node_id,kind,start_ts,end_ts,cause,synthetic) "
+                        "VALUES(?,?,?,?,?,?,?)", recs)
+    return len(recs)
+
+
+FRAME_COLS = ["int_id", "node", "kind", "start", "dur", "tp", "feeder", "raion", "customers", "cause", "ongoing"]
+
+
+def interruption_frame(start, end, kinds, min_min=3, raion=None) -> pd.DataFrame:
+    """Один рядок на пару (відключення, ТП): вузол аварії каскадно охоплює всі ТП нижче."""
+    now, recs = datetime.now(timezone.utc), []
+    for r in q("SELECT * FROM interruptions WHERE start_ts>=? AND start_ts<?", (iso_utc(start), iso_utc(end))):
+        if r["kind"] not in kinds or r["node_id"] not in GRID:
+            continue
+        a, b = pdt(r["start_ts"]), (pdt(r["end_ts"]) if r["end_ts"] else now)
+        if not a or not b or (b - a).total_seconds() / 60 < min_min:
+            continue
+        dur = (b - a).total_seconds() / 60
+        for tp in tps_under(r["node_id"]):
+            if raion and tp_raion(tp) != raion:
+                continue
+            recs.append(dict(int_id=r["id"], node=r["node_id"], kind=r["kind"], start=a, dur=dur, tp=tp,
+                             feeder=GRID[tp]["parent"], raion=tp_raion(tp), customers=GRID[tp]["customers"],
+                             cause=r["cause"], ongoing=not r["end_ts"]))
+    df = pd.DataFrame(recs, columns=FRAME_COLS)
+    df["start"] = pd.to_datetime(df["start"], utc=True)
+    return df
+
+
+def kpis(df: pd.DataFrame, n_total: int, days: int) -> dict:
+    if df.empty or n_total <= 0:
+        return dict(saifi=0.0, saidi=0.0, caidi=0.0, asai=100.0, events=0)
+    saifi = df["customers"].sum() / n_total
+    saidi = (df["customers"] * df["dur"]).sum() / n_total
+    return dict(saifi=saifi, saidi=saidi, caidi=saidi / saifi if saifi else 0.0,
+                asai=100 * (1 - saidi / (days * 1440)), events=int(df["int_id"].nunique()))
+
+
+def risk_label(score: float, events: int) -> str:
+    return "Високий" if score >= 2.5 and events >= 3 else "Підвищений" if score >= 1.5 and events >= 2 else "Норма"
+
+
+def reliability_tab(cfg):
+    st.markdown("**Індекси надійності електропостачання: SAIFI / SAIDI / CAIDI**")
+    c1, c2, c3, c4 = st.columns(4)
+    days = c1.radio("Період, діб", [30, 90], horizontal=True, key="rel_days")
+    scope = c2.selectbox("Територія", ["Вся область"] + RAIONS, key="rel_scope")
+    typ = c3.selectbox("Тип відключень", list(TYPE_FILTERS), key="rel_type")
+    min_min = c4.slider("Мін. тривалість, хв", 0, 30, 3, key="rel_min")
+    raion, kinds = (None if scope == "Вся область" else scope), TYPE_FILTERS[typ]
+    now = datetime.now(timezone.utc)
+    start = now - timedelta(days=days)
+    n_total = customers_total(raion)
+    df = interruption_frame(start, now + timedelta(minutes=1), kinds, min_min, raion)
+    prev = interruption_frame(start - timedelta(days=days), start, kinds, min_min, raion)
+    k, kp, has_prev = kpis(df, n_total, days), kpis(prev, n_total, days), not prev.empty
+
+    def delta(key, fmt):
+        return fmt.format(k[key] - kp[key]) if has_prev else None
+
+    m = st.columns(5)
+    m[0].metric("SAIFI", f"{k['saifi']:.2f}", delta("saifi", "{:+.2f}"), delta_color="inverse",
+                help="Середня кількість відключень на одного споживача за період")
+    m[1].metric("SAIDI", f"{k['saidi']:.0f} хв", delta("saidi", "{:+.0f} хв"), delta_color="inverse",
+                help=f"Середня сумарна тривалість відключень на споживача ≈ {k['saidi'] / 60:.1f} год")
+    m[2].metric("CAIDI", f"{k['caidi']:.0f} хв", delta("caidi", "{:+.0f} хв"), delta_color="inverse",
+                help="Середній час відновлення живлення = SAIDI / SAIFI")
+    m[3].metric("ASAI", f"{k['asai']:.3f} %", delta("asai", "{:+.3f} %"),
+                help="Середня доступність електропостачання")
+    m[4].metric("Відключень", k["events"], f"{k['events'] - kp['events']:+d}" if has_prev else None,
+                delta_color="inverse")
+    st.caption(f"SAIFI = Σ(споживачі × відключення) / N · SAIDI = Σ(споживачі × хвилини) / N · CAIDI = SAIDI / SAIFI, "
+               f"N = {n_total:,} споживачів ({scope}; кількість абонентів на ТП — модель, замініть даними білінгу). "
+               f"Враховано відключення ≥ {min_min} хв; триваючі рахуються до поточного моменту. "
+               + ("Зміна — відносно попереднього періоду такої ж довжини." if has_prev else "Попередній період без даних."))
+
+    if cfg["DEMO"]:
+        with st.expander("🧪 Демо-дані історії відключень"):
+            d1, d2 = st.columns(2)
+            if d1.button("Згенерувати історію за 90 діб"):
+                st.success(f"Створено записів: {seed_history()}")
+                st.rerun()
+            if d2.button("Видалити демо-історію"):
+                with DB_LOCK, db() as con:
+                    con.execute("DELETE FROM interruptions WHERE synthetic=1")
+                st.rerun()
+    if df.empty:
+        st.info("За вибраними параметрами відключень немає.")
+        return
+    if px is None:
+        st.warning("Для графіків встановіть plotly: `pip install plotly` (додайте у requirements.txt).")
+        return
+
+    freq = "D" if days <= 30 else "W"
+    work = df.assign(cm=df["customers"] * df["dur"], b=df["start"].dt.tz_convert(None).dt.to_period(freq))
+    idx = pd.period_range(start.replace(tzinfo=None), now.replace(tzinfo=None), freq=freq)
+    agg = work.groupby("b").agg(cust=("customers", "sum"), cm=("cm", "sum")).reindex(idx, fill_value=0)
+    xs = [p.start_time for p in agg.index]
+
+    st.markdown(f"##### Тренд ({'по днях' if freq == 'D' else 'по тижнях'})")
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+    fig.add_bar(x=xs, y=agg["cm"] / n_total, name="SAIDI, хв", marker_color="#e53935")
+    fig.add_scatter(x=xs, y=agg["cust"] / n_total, name="SAIFI", mode="lines+markers",
+                    line=dict(color="#1f77b4", width=3), secondary_y=True)
+    fig.update_yaxes(title_text="SAIDI, хв на споживача", secondary_y=False)
+    fig.update_yaxes(title_text="SAIFI, відключень на споживача", secondary_y=True)
+    fig.update_layout(template="plotly_white", height=380, margin=dict(t=20, b=20),
+                      legend=dict(orientation="h", y=1.12))
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.markdown("##### Повторюваність відключень за районами")
+    ev = work.drop_duplicates(["int_id", "raion"])
+    bk = ev.groupby(["raion", "kind"]).size().reset_index(name="Подій")
+    bk["Тип"] = bk["kind"].map(KIND_LABELS)
+    g1, g2 = st.columns(2)
+    f1 = px.bar(bk, x="raion", y="Подій", color="Тип", barmode="stack", template="plotly_white",
+                color_discrete_map={"Аварійне": "#e53935", "Планове": "#fb8c00"},
+                labels={"raion": "Район"}, title="Кількість відключень")
+    f1.update_layout(height=360, margin=dict(t=50, b=20), legend=dict(orientation="h", y=-0.25))
+    g1.plotly_chart(f1, use_container_width=True)
+    rr = work.groupby("raion").agg(cust=("customers", "sum"), cm=("cm", "sum")).reset_index()
+    rr["N"] = rr["raion"].map(customers_total)
+    rr["SAIFI"], rr["SAIDI"] = rr["cust"] / rr["N"], rr["cm"] / rr["N"]
+    f2 = px.bar(rr.sort_values("SAIDI"), x="SAIDI", y="raion", orientation="h", color="SAIFI", text_auto=".0f",
+                color_continuous_scale="YlOrRd", template="plotly_white", labels={"raion": "Район", "SAIDI": "SAIDI, хв"},
+                title="SAIDI за районами (колір — SAIFI)")
+    f2.update_layout(height=360, margin=dict(t=50, b=20))
+    g2.plotly_chart(f2, use_container_width=True)
+    labels = [p.start_time.strftime("%d.%m") for p in idx]
+    hm = ev.assign(bl=ev["b"].dt.start_time.dt.strftime("%d.%m")).pivot_table(
+        index="raion", columns="bl", values="int_id", aggfunc="count", fill_value=0)
+    hm = hm.reindex(index=[raion] if raion else RAIONS, columns=labels, fill_value=0)
+    f3 = px.imshow(hm, aspect="auto", color_continuous_scale="YlOrRd", template="plotly_white",
+                   labels=dict(x="Початок періоду", y="Район", color="Подій"),
+                   title="Теплова матриця: відключення за районами та часом")
+    f3.update_layout(height=300, margin=dict(t=50, b=20))
+    st.plotly_chart(f3, use_container_width=True)
+
+    st.markdown(f"##### Найбільш проблемні (зношені) фідери за {days} діб")
+    topn = st.slider("Показати фідерів", 5, 20, 10, key="rel_top")
+    fd = work[work["node"].map(lambda n: GRID[n]["type"]).isin(["feeder", "tp"])]
+    fs = (fd.drop_duplicates(["int_id", "feeder"]).groupby("feeder").agg(events=("int_id", "nunique"), down=("dur", "sum"))
+          .join(fd.groupby("feeder")["cm"].sum().rename("cm")))
+    all_f = [f for f, g in GRID.items() if g["type"] == "feeder" and (raion is None or tp_raion(tps_under(f)[0]) == raion)]
+    fs = fs.reindex(all_f, fill_value=0)
+    fs["score"] = fs["events"] / (fs["events"].mean() or 1)
+    fs["risk"] = [risk_label(a, int(b)) for a, b in zip(fs["score"], fs["events"])]
+    fs["name"] = [GRID[i]["name"] for i in fs.index]
+    top = fs.sort_values(["events", "cm"], ascending=False).head(topn)
+    f4 = px.bar(top.iloc[::-1], x="events", y="name", orientation="h", color="risk", text="events",
+                color_discrete_map={"Високий": "#e53935", "Підвищений": "#fb8c00", "Норма": "#2ea043"},
+                template="plotly_white", labels={"events": "Відключень", "name": "", "risk": "Ризик"})
+    f4.update_layout(height=max(320, 32 * len(top)), margin=dict(t=20, b=20), legend=dict(orientation="h", y=1.08))
+    st.plotly_chart(f4, use_container_width=True)
+    icon = {"Високий": "🔴 Високий", "Підвищений": "🟠 Підвищений", "Норма": "🟢 Норма"}
+    tbl = pd.DataFrame({"Фідер": top["name"], "Відключень": top["events"], "Сумарно, год": (top["down"] / 60).round(1),
+                        "Інтервал між, діб": [round(days / e, 1) if e else None for e in top["events"]],
+                        "Індекс зношення": top["score"].round(2), "Ризик": top["risk"].map(icon)})
+    st.dataframe(tbl, use_container_width=True, hide_index=True)
+    st.caption("Індекс зношення = кількість відключень фідера / середня кількість по фідерах (≥2.5 — високий, ≥1.5 — підвищений). "
+               "Відключення вищого рівня (підстанція) у рейтинг фідерів не входять.")
+    wc = work.drop_duplicates("int_id")["cause"].value_counts().reset_index()
+    wc.columns = ["Причина", "Подій"]
+    f5 = px.bar(wc.iloc[::-1], x="Подій", y="Причина", orientation="h", template="plotly_white", title="Причини відключень")
+    f5.update_layout(height=300, margin=dict(t=50, b=20))
+    st.plotly_chart(f5, use_container_width=True)
+    with st.expander("📋 Реєстр відключень"):
+        reg = work.groupby("int_id").agg(Початок=("start", "min"), Вузол=("node", "first"), Тип=("kind", "first"),
+                                         Хвилин=("dur", "first"), Споживачів=("customers", "sum"),
+                                         Причина=("cause", "first")).reset_index()
+        reg["Вузол"], reg["Тип"] = reg["Вузол"].map(line_label), reg["Тип"].map(KIND_LABELS)
+        reg["Початок"], reg["Хвилин"] = reg["Початок"].dt.strftime("%d.%m.%Y %H:%M"), reg["Хвилин"].round(0)
+        st.dataframe(reg, use_container_width=True, hide_index=True)
+        st.download_button("⬇️ Завантажити CSV", reg.to_csv(index=False).encode("utf-8-sig"), "interruptions.csv", "text/csv")
+
+
 def oblast_map():
     st.subheader("Карта мережі Вінницької області")
 
@@ -1048,6 +1338,8 @@ def main():
             con.execute("INSERT INTO consumers(account,name,address,line_id,salt,pin_hash,email,phone) "
                         "VALUES('1001','Іван Петренко','м. Вінниця, вул. Соборна, 12','VIN-2',?,?,'ivan@example.com',"
                         "'+380501112233')", (salt, hash_pin("1234", salt)))
+    if cfg["DEMO"] and q("SELECT COUNT(*) AS n FROM interruptions")[0]["n"] == 0:
+        seed_history()
     start_poller(tuple(sorted(cfg.items())))
 
     st.title("⚡ Сервіс інформування споживачів — Вінницька область")
