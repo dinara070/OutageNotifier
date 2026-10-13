@@ -1,5 +1,5 @@
 """
-Клієнтський сервіс інформування споживачів про планові ремонти та аварії.
+Клієнтський сервіс інформування споживачів Вінницької області про планові ремонти та аварії.
 
 Запуск:  pip install streamlit requests
          streamlit run app.py
@@ -48,6 +48,44 @@ MAX_SKEW_SEC = 300
 KINDS = {"outage": "🚨 Аварія", "planned": "🛠️ Плановий ремонт"}
 STATUSES = {"active": "Триває", "scheduled": "Заплановано", "resolved": "Усунено"}
 DEMO_SECRET = "demo-secret-change-me"
+
+# Населені пункти Вінницької області (код лінії: назва, район, широта, довгота).
+# Координати та належність до районів (після реформи 2020 р.) орієнтовні — уточніть за потреби.
+SETTLEMENTS = {
+    "VIN": ("Вінниця", "Вінницький", 49.2331, 28.4682),
+    "KAL": ("Калинівка", "Вінницький", 49.4560, 28.5120),
+    "TYV": ("Тиврів", "Вінницький", 49.0150, 28.4920),
+    "ILL": ("Іллінці", "Вінницький", 49.1030, 29.2150),
+    "LYP": ("Липовець", "Вінницький", 49.2150, 29.0130),
+    "NEM": ("Немирів", "Вінницький", 48.9700, 28.8400),
+    "POH": ("Погребище", "Вінницький", 49.4850, 29.2670),
+    "ZHM": ("Жмеринка", "Жмеринський", 49.0354, 28.1147),
+    "SHA": ("Шаргород", "Жмеринський", 48.7380, 28.0850),
+    "BAR": ("Бар", "Жмеринський", 49.0750, 27.6770),
+    "MKU": ("Муровані Курилівці", "Жмеринський", 48.7230, 27.5110),
+    "MOG": ("Могилів-Подільський", "Могилів-Подільський", 48.4498, 27.7978),
+    "YAM": ("Ямпіль", "Могилів-Подільський", 48.2310, 28.2820),
+    "KHM": ("Хмільник", "Хмільницький", 49.5560, 27.9710),
+    "KOZ": ("Козятин", "Хмільницький", 49.7130, 28.8450),
+    "TUL": ("Тульчин", "Тульчинський", 48.6783, 28.8486),
+    "TOM": ("Томашпіль", "Тульчинський", 48.5480, 28.5130),
+    "KRY": ("Крижопіль", "Тульчинський", 48.3800, 28.8650),
+    "HAI": ("Гайсин", "Гайсинський", 48.8097, 29.3844),
+    "BER": ("Бершадь", "Гайсинський", 48.3703, 29.5214),
+    "LAD": ("Ладижин", "Гайсинський", 48.6836, 29.2330),
+}
+LINES = {f"{code}-{n}": code for code in SETTLEMENTS for n in (1, 2, 3)}  # фідери: VIN-1, VIN-2 ...
+
+PROJECT_LINKS = [
+    ("Grid What-If", "https://grid-whatif.streamlit.app/"),
+    ("MVP Blob", "https://mvp-blob.streamlit.app/?theme=light"),
+    ("GIS Dispatch", "https://gis-dispatch.streamlit.app/"),
+]
+
+
+def line_label(line: str) -> str:
+    code = LINES.get(line)
+    return f"{line} · {SETTLEMENTS[code][0]}" if code else line
 
 
 # ───────────────────────────── Конфігурація ─────────────────────────────
@@ -116,7 +154,7 @@ class Simulator:
         self.incidents: dict[str, dict] = {}
         self.lock = threading.Lock()
         now = datetime.now(timezone.utc)
-        self.add("planned", "L-102", "Заміна опор на вул. Соборній",
+        self.add("planned", "VIN-2", "Заміна опор на вул. Соборній (м. Вінниця)",
                  "Планове відключення для заміни опор ЛЕП.",
                  now + timedelta(hours=20), now + timedelta(hours=26), "scheduled")
 
@@ -193,7 +231,7 @@ def fetch_incidents(cfg: dict) -> list[dict]:
 def build_message(inc: sqlite3.Row | dict, c: sqlite3.Row) -> tuple[str, str]:
     kind, status = KINDS[inc["kind"]], STATUSES[inc["status"]]
     subj = f"{kind}: {inc['title']} ({status})"
-    body = (f"Шановний(а) {c['name']}!\n\n{kind} на вашій лінії {inc['line_id']} "
+    body = (f"Шановний(а) {c['name']}!\n\n{kind} на вашій лінії {line_label(inc['line_id'])} "
             f"(адреса: {c['address']}).\nСтатус: {status}\n"
             f"Початок: {fmt_dt(inc['starts_at'])}\nОрієнтовне завершення: {fmt_dt(inc['ends_at'])}\n"
             f"{inc['description'] or ''}\n\nОстаннє оновлення: {fmt_dt(inc['updated_at'])}")
@@ -320,7 +358,7 @@ def consumer_portal():
         return
     with DB_LOCK, db() as con:
         c = con.execute("SELECT * FROM consumers WHERE id=?", (st.session_state.consumer_id,)).fetchone()
-    st.write(f"👤 **{c['name']}** · {c['address']} · лінія **{c['line_id']}**")
+    st.write(f"👤 **{c['name']}** · {c['address']} · лінія **{line_label(c['line_id'])}**")
     if st.button("Вийти"):
         del st.session_state["consumer_id"]
         st.rerun()
@@ -381,7 +419,8 @@ def admin_panel(cfg):
         with st.form("add_consumer", clear_on_submit=True):
             a, b = st.columns(2)
             acc, name = a.text_input("Особовий рахунок"), b.text_input("ПІБ")
-            addr, line = a.text_input("Адреса"), b.text_input("Лінія мережі (напр. L-101)")
+            addr = a.text_input("Адреса (вулиця, будинок)")
+            line = b.selectbox("Лінія мережі (населений пункт)", list(LINES), format_func=line_label)
             email, phone = a.text_input("Email"), b.text_input("Телефон")
             tg, pin = a.text_input("Telegram chat_id"), b.text_input("PIN (мін. 4 цифри)", type="password")
             if st.form_submit_button("Додати споживача"):
@@ -393,7 +432,7 @@ def admin_panel(cfg):
                         with DB_LOCK, db() as con:
                             con.execute("INSERT INTO consumers(account,name,address,line_id,salt,pin_hash,"
                                         "email,phone,telegram_chat) VALUES(?,?,?,?,?,?,?,?,?)",
-                                        (acc, name, addr, line.strip().upper(), salt, hash_pin(pin, salt),
+                                        (acc, name, f"{SETTLEMENTS[LINES[line]][0]}, {addr}", line, salt, hash_pin(pin, salt),
                                          email, phone, tg))
                         st.success("Додано")
                     except sqlite3.IntegrityError:
@@ -414,7 +453,7 @@ def admin_panel(cfg):
             st.info("Симулятор доступний лише в демо-режимі.")
         else:
             sim = get_simulator()
-            line = st.selectbox("Лінія", [f"L-{n}" for n in range(101, 106)])
+            line = st.selectbox("Лінія", list(LINES), format_func=line_label)
             kind = st.radio("Тип", list(KINDS), format_func=KINDS.get, horizontal=True)
             title = st.text_input("Заголовок", "Пошкодження кабелю")
             hours = st.slider("Тривалість, год", 1, 12, 4)
@@ -431,23 +470,75 @@ def admin_panel(cfg):
                 st.success("Статус оновлено")
 
 
+def oblast_map():
+    st.subheader("Карта подій по Вінницькій області")
+
+    @st.fragment(run_every=10)
+    def live():
+        with DB_LOCK, db() as con:
+            rows = con.execute("SELECT * FROM incidents WHERE status!='resolved'").fetchall()
+        base = pd.DataFrame([{"lat": v[2], "lon": v[3], "color": "#4a90d9", "size": 600}
+                             for v in SETTLEMENTS.values()])
+        ev = pd.DataFrame([{"lat": SETTLEMENTS[LINES[r["line_id"]]][2], "lon": SETTLEMENTS[LINES[r["line_id"]]][3],
+                            "color": "#e53935" if r["kind"] == "outage" else "#fb8c00", "size": 1800}
+                           for r in rows if r["line_id"] in LINES])
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Активні аварії", sum(r["kind"] == "outage" and r["status"] == "active" for r in rows))
+        m2.metric("Заплановані ремонти", sum(r["kind"] == "planned" for r in rows))
+        with DB_LOCK, db() as con:
+            m3.metric("Споживачів у реєстрі", con.execute("SELECT COUNT(*) FROM consumers").fetchone()[0])
+        st.map(pd.concat([base, ev]), latitude="lat", longitude="lon", color="color", size="size", zoom=7)
+        st.caption("🔵 населені пункти · 🔴 аварія · 🟠 плановий ремонт")
+        if rows:
+            st.dataframe(pd.DataFrame([{
+                "Район": SETTLEMENTS[LINES[r["line_id"]]][1] if r["line_id"] in LINES else "—",
+                "Лінія": line_label(r["line_id"]), "Тип": KINDS[r["kind"]], "Подія": r["title"],
+                "Статус": STATUSES[r["status"]], "Початок": fmt_dt(r["starts_at"])} for r in rows]),
+                use_container_width=True, hide_index=True)
+
+    live()
+
+
+def projects_page():
+    st.subheader("Пов'язані проєкти")
+    cols = st.columns(len(PROJECT_LINKS))
+    for col, (name, url) in zip(cols, PROJECT_LINKS):
+        col.link_button(f"🔗 {name}", url, use_container_width=True)
+    st.divider()
+    pick = st.selectbox("Переглянути вбудовано", [n for n, _ in PROJECT_LINKS])
+    url = dict(PROJECT_LINKS)[pick]
+    st.components.v1.iframe(url + ("&" if "?" in url else "?") + "embed=true", height=720, scrolling=True)
+    st.caption("Якщо застосунок не відображається у рамці — відкрийте його кнопкою вище.")
+
+
 def main():
-    st.set_page_config(page_title="Сервіс інформування", page_icon="⚡", layout="wide")
+    st.set_page_config(page_title="Сервіс інформування — Вінницька область", page_icon="⚡", layout="wide")
     cfg = load_config()
     init_db()
     with DB_LOCK, db() as con:
         if con.execute("SELECT COUNT(*) FROM consumers").fetchone()[0] == 0 and cfg["DEMO"]:
             salt = os.urandom(16).hex()
             con.execute("INSERT INTO consumers(account,name,address,line_id,salt,pin_hash,email,phone) "
-                        "VALUES('1001','Іван Петренко','вул. Соборна, 12','L-102',?,?,'ivan@example.com',"
+                        "VALUES('1001','Іван Петренко','м. Вінниця, вул. Соборна, 12','VIN-2',?,?,'ivan@example.com',"
                         "'+380501112233')", (salt, hash_pin("1234", salt)))
     start_poller(tuple(sorted(cfg.items())))
 
-    st.title("⚡ Сервіс інформування споживачів")
-    st.caption("Автоматичні сповіщення про планові ремонти та аварії на вашій лінії мережі")
-    mode = st.sidebar.radio("Розділ", ["Кабінет споживача", "Диспетчер"])
+    st.title("⚡ Сервіс інформування споживачів — Вінницька область")
+    st.caption("Автоматичні сповіщення про планові ремонти та аварії на вашій лінії мережі "
+               "(21 населений пункт, 6 районів)")
+    mode = st.sidebar.radio("Розділ", ["Кабінет споживача", "Карта області", "Диспетчер", "Пов'язані проєкти"])
+    st.sidebar.markdown("**Проєкти**")
+    for name, url in PROJECT_LINKS:
+        st.sidebar.link_button(f"🔗 {name}", url, use_container_width=True)
     st.sidebar.markdown(f"🔒 Канал даних: {'демо (підписаний симулятор)' if cfg['DEMO'] else 'HTTPS + HMAC'}")
-    consumer_portal() if mode == "Кабінет споживача" else admin_panel(cfg)
+    if mode == "Кабінет споживача":
+        consumer_portal()
+    elif mode == "Карта області":
+        oblast_map()
+    elif mode == "Диспетчер":
+        admin_panel(cfg)
+    else:
+        projects_page()
 
 
 main()
