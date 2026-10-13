@@ -55,7 +55,14 @@ except ImportError:  # потрібен лише для бойового реж�
     requests = None
 
 DB_PATH = os.environ.get("NOTIFY_DB", "notify.db")
-DB_LOCK = threading.RLock()
+
+
+@st.cache_resource
+def shared_locks():
+    return {"db": threading.RLock(), "auto": threading.RLock()}
+
+
+DB_LOCK, AUTO_LOCK = shared_locks()["db"], shared_locks()["auto"]
 MAX_SKEW_SEC = 300
 KINDS = {"outage": "🚨 Аварія", "planned": "🛠️ Плановий ремонт"}
 STATUSES = {"active": "Триває", "scheduled": "Заплановано", "resolved": "Усунено"}
@@ -197,7 +204,14 @@ def load_config() -> dict:
 
     cfg = {k: g(k) for k in (
         "MONITORING_URL", "MONITORING_TOKEN", "MONITORING_HMAC_SECRET", "ADMIN_PASSWORD",
-        "SMTP_HOST", "SMTP_PORT", "SMTP_USER", "SMTP_PASSWORD", "SMTP_FROM", "TELEGRAM_BOT_TOKEN")}
+        "SMTP_HOST", "SMTP_PORT", "SMTP_USER", "SMTP_PASSWORD", "SMTP_FROM", "TELEGRAM_BOT_TOKEN",
+        "MQTT_HOST", "MQTT_PORT", "MQTT_USER", "MQTT_PASSWORD", "MQTT_TLS", "MQTT_TOPIC", "MQTT_HMAC_SECRET",
+        "MODBUS_DEVICES")}
+    for k, v in list(cfg.items()):  # значення мають бути хешованими (ключ кешу потоків)
+        if not isinstance(v, (str, int, float, bool, type(None))):
+            cfg[k] = json.dumps(v, default=lambda o: dict(o) if hasattr(o, "items") else list(o))
+    cfg["TELEMETRY_INTERVAL_SEC"] = int(g("TELEMETRY_INTERVAL_SEC", 10))
+    cfg["MODBUS_INTERVAL_SEC"] = int(g("MODBUS_INTERVAL_SEC", 15))
     cfg["POLL_INTERVAL_SEC"] = int(g("POLL_INTERVAL_SEC", 20))
     cfg["DEMO"] = not (cfg["MONITORING_URL"] and cfg["MONITORING_HMAC_SECRET"])
     if cfg["DEMO"]:
@@ -208,7 +222,8 @@ def load_config() -> dict:
 
 # ───────────────────────────── База даних ─────────────────────────────
 def db() -> sqlite3.Connection:
-    con = sqlite3.connect(DB_PATH, check_same_thread=False)
+    con = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=15)
+    con.execute("PRAGMA journal_mode=WAL")
     con.row_factory = sqlite3.Row
     return con
 
@@ -233,6 +248,15 @@ def init_db():
         CREATE TABLE IF NOT EXISTS interruptions(
             id INTEGER PRIMARY KEY, incident_id TEXT, node_id TEXT, kind TEXT, start_ts TEXT,
             end_ts TEXT, cause TEXT, synthetic INT DEFAULT 0);
+        CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
+        CREATE TABLE IF NOT EXISTS telemetry_latest(
+            tp_id TEXT PRIMARY KEY, ts TEXT, voltage REAL, power_kw REAL, source TEXT,
+            low_since TEXT, spike_ts TEXT, log_ts TEXT);
+        CREATE TABLE IF NOT EXISTS telemetry_log(
+            id INTEGER PRIMARY KEY, ts TEXT, tp_id TEXT, voltage REAL, power_kw REAL);
+        CREATE INDEX IF NOT EXISTS ix_tlog ON telemetry_log(tp_id, ts);
+        CREATE TABLE IF NOT EXISTS auto_log(
+            id INTEGER PRIMARY KEY, ts TEXT, source TEXT, node TEXT, detail TEXT);
         CREATE TABLE IF NOT EXISTS poll_log(
             id INTEGER PRIMARY KEY, ts TEXT, ok INT, message TEXT);
         """)
@@ -431,6 +455,12 @@ def start_poller(cfg_items: tuple):
     def loop():
         while True:
             poll_once(cfg)
+            try:
+                auto_detect(cfg)  # автоінциденти за скаргами та телеметрією
+            except Exception as e:
+                with DB_LOCK, db() as con:
+                    con.execute("INSERT INTO poll_log(ts,ok,message) VALUES(?,?,?)",
+                                (now_iso(), 0, f"Автовиявлення: {e}"))
             time.sleep(max(5, cfg["POLL_INTERVAL_SEC"]))
 
     t = threading.Thread(target=loop, daemon=True, name="poller")
@@ -625,6 +655,10 @@ def consumer_portal():
                     with DB_LOCK, db() as con:
                         con.execute("INSERT INTO reports(ts,consumer_id,line_id,category,text) VALUES(?,?,?,?,?)",
                                     (now_iso(), c["id"], c["line_id"], cat, txt.strip()))
+                    try:
+                        auto_detect(cfg)  # можливий кластер скарг → автоінцидент
+                    except Exception:
+                        pass
                     st.success("Звернення надіслано")
         mine = qdf("SELECT id AS №, ts AS Час, category AS Тема, text AS Опис, status AS Статус "
                    "FROM reports WHERE consumer_id=? ORDER BY id DESC LIMIT 50", (c["id"],))
@@ -694,9 +728,9 @@ def admin_panel(cfg):
         return
     if cfg["ADMIN_PASSWORD"] == ADMIN_PASSWORD:
         st.warning("Пароль вшито в код — для безпеки задайте ADMIN_PASSWORD у secrets.")
-    t1, t2, t3, t4, t5, t6, t7, t8 = st.tabs(["📡 Моніторинг", "👥 Споживачі", "📨 Журнал сповіщень", "🧪 Симулятор",
-                                              "📝 Звернення", "🗺️ GIS-аналітика", "🕸️ Топологія",
-                                              "📈 Надійність"])
+    t1, t2, t3, t4, t5, t6, t7, t8, t9 = st.tabs(["📡 Моніторинг", "👥 Споживачі", "📨 Журнал сповіщень",
+                                                  "🧪 Симулятор", "📝 Звернення", "🗺️ GIS-аналітика", "🕸️ Топологія",
+                                                  "📈 Надійність", "📟 IoT / SCADA"])
 
     with t1:
         c1, c2 = st.columns([1, 3])
@@ -771,10 +805,15 @@ def admin_panel(cfg):
                 st.success("Роботи розпочато — відключення буде враховано в SAIDI/SAIFI")
             st.divider()
             st.markdown("**Хвиля скарг споживачів** (для теплової карти) — навколо вузла, обраного вище")
-            nwave = st.slider("Кількість скарг", 5, 80, 40, key="wave_n")
-            w1, w2 = st.columns(2)
-            if w1.button("📣 Згенерувати скарги"):
+            nwave = st.slider("Кількість скарг", 5, 200, 40, key="wave_n")
+            w1, w2, w3 = st.columns(3)
+            if w1.button("📣 Згенерувати скарги (30 хв)"):
                 st.success(f"Додано скарг: {gen_complaints(line, nwave)}")
+            if w3.button("⏱️ Скарги за 5 хв (автоінцидент)"):
+                added = gen_complaints(line, nwave, max(int(get_setting("auto_window_min")) - 1, 0))
+                made = auto_detect(cfg)
+                st.success(f"Додано скарг: {added}. " + (" ".join(made) if made else
+                           "Автоінцидент не створено (поріг не перевищено або вузол уже в аварії)."))
             if w2.button("🧹 Видалити демо-скарги"):
                 with DB_LOCK, db() as con:
                     con.execute("DELETE FROM reports WHERE consumer_id=0")
@@ -847,6 +886,9 @@ def admin_panel(cfg):
 
     with t8:
         reliability_tab(cfg)
+
+    with t9:
+        iot_tab(cfg)
 
 
 def inc_level(r) -> int:
@@ -987,16 +1029,16 @@ def complaint_clusters(pts: pd.DataFrame, res: dict, thr: int):
     return pd.DataFrame(rows), warns
 
 
-def gen_complaints(node: str, n: int) -> int:
+def gen_complaints(node: str, n: int, window: int = 30) -> int:
     tps = [i for i in descendants(node) if GRID[i]["type"] == "tp"]
     if not tps:
         return 0
     now = datetime.now(timezone.utc)
     with DB_LOCK, db() as con:
-        for _ in range(n):
-            ts = (now - timedelta(minutes=random.randint(0, 30))).replace(microsecond=0).isoformat()
+        for k in range(n):
+            ts = (now - timedelta(minutes=random.randint(0, window))).replace(microsecond=0).isoformat()
             con.execute("INSERT INTO reports(ts,consumer_id,line_id,category,text) VALUES(?,?,?,?,?)",
-                        (ts, 0, random.choice(tps), REPORT_CATEGORIES[0], "Демо-скарга (симулятор)"))
+                        (ts, 0, tps[k % len(tps)], REPORT_CATEGORIES[0], "Демо-скарга (симулятор)"))
     return n
 
 
@@ -1285,6 +1327,500 @@ def reliability_tab(cfg):
         st.download_button("⬇️ Завантажити CSV", reg.to_csv(index=False).encode("utf-8-sig"), "interruptions.csv", "text/csv")
 
 
+# ───────────────────────── IoT / SCADA: телеметрія та автовиявлення аварій ─────────────────────────
+DEFAULTS = {"auto_enabled": "1", "auto_n": "3", "auto_window_min": "5", "tele_confirm_sec": "30",
+            "tele_loss_v": "40", "tele_stale_min": "5", "tele_faults": "{}"}
+TELE_LABELS = {"ok": "🟢 Норма", "low": "🟠 Знижена напруга", "high": "🟠 Перенапруга", "spike": "🟠 Стрибок",
+               "dark": "🔴 Немає напруги", "nocomm": "⚪ Немає зв'язку"}
+TELE_COLORS = {"ok": [46, 160, 67, 235], "low": [251, 140, 0, 235], "high": [251, 140, 0, 235],
+               "spike": [255, 193, 7, 235], "dark": [229, 57, 53, 235], "nocomm": [150, 150, 150, 220]}
+
+
+def get_setting(key: str) -> str:
+    rows = q("SELECT value FROM settings WHERE key=?", (key,))
+    return rows[0]["value"] if rows else DEFAULTS[key]
+
+
+def set_setting(key: str, value) -> None:
+    with DB_LOCK, db() as con:
+        con.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", (key, str(value)))
+
+
+@st.cache_resource
+def iot_state() -> dict:
+    return {k: {"state": "вимкнено", "ok": 0, "err": 0, "last": ""} for k in ("sim", "mqtt", "modbus")}
+
+
+@functools.lru_cache(maxsize=None)
+def feeders_under(node: str) -> tuple:
+    return tuple(i for i in descendants(node) if GRID[i]["type"] == "feeder")
+
+
+def to_dt(v):
+    if isinstance(v, (int, float)):
+        return datetime.fromtimestamp(v, tz=timezone.utc)
+    return pdt(v)
+
+
+def ingest_readings(readings: list) -> tuple:
+    """Валідація та запис телеметрії ТП. Повертає (кількість прийнятих, остання помилка)."""
+    now, ok, err = datetime.now(timezone.utc), 0, ""
+    loss_v = float(get_setting("tele_loss_v"))
+    with DB_LOCK, db() as con:
+        for r in readings:
+            try:
+                tp = r.get("tp")
+                if tp not in GRID or GRID[tp]["type"] != "tp":
+                    raise ValueError(f"Невідома ТП: {str(tp)[:40]}")
+                v, pw = float(r["voltage"]), float(r.get("power_kw") or 0)
+                if not (math.isfinite(v) and math.isfinite(pw)) or not 0 <= v <= 500 or not 0 <= pw <= 10000:
+                    raise ValueError("Значення поза допустимим діапазоном")
+                t = to_dt(r["ts"]) if r.get("ts") is not None else now
+                if not t or abs((now - t).total_seconds()) > 600:
+                    raise ValueError("Часова мітка поза допустимим вікном (±10 хв)")
+                prev = con.execute("SELECT * FROM telemetry_latest WHERE tp_id=?", (tp,)).fetchone()
+                low = v < loss_v
+                low_since = ((prev["low_since"] if prev and prev["low_since"] else iso_utc(t)) if low else None)
+                spike = prev["spike_ts"] if prev else None
+                if prev and prev["voltage"] > loss_v and v > loss_v and abs(v - prev["voltage"]) / prev["voltage"] > 0.10:
+                    spike = iso_utc(t)  # стрибок напруги
+                if prev and prev["power_kw"] > 5 and pw > 0 and abs(pw - prev["power_kw"]) / prev["power_kw"] > 0.6:
+                    spike = iso_utc(t)  # стрибок навантаження
+                lt = pdt(prev["log_ts"]) if prev and prev["log_ts"] else None
+                log_ts = prev["log_ts"] if prev else None
+                if low or v < 207 or v > 253 or not lt or (t - lt).total_seconds() >= 60:
+                    con.execute("INSERT INTO telemetry_log(ts,tp_id,voltage,power_kw) VALUES(?,?,?,?)",
+                                (iso_utc(t), tp, v, pw))
+                    log_ts = iso_utc(t)
+                con.execute("INSERT OR REPLACE INTO telemetry_latest VALUES(?,?,?,?,?,?,?,?)",
+                            (tp, iso_utc(t), v, pw, str(r.get("source", "?"))[:20], low_since, spike, log_ts))
+                ok += 1
+            except Exception as e:
+                err = str(e)[:150]
+        if random.random() < 0.02:
+            con.execute("DELETE FROM telemetry_log WHERE ts<?", (iso_utc(now - timedelta(hours=6)),))
+    return ok, err
+
+
+def tele_status(r, now, loss_v: float, stale_min: int) -> str:
+    t = pdt(r["ts"])
+    if not t or (now - t).total_seconds() > stale_min * 60:
+        return "nocomm"
+    if r["voltage"] < loss_v:
+        return "dark"
+    if r["voltage"] < 207:
+        return "low"
+    if r["voltage"] > 253:
+        return "high"
+    sp = pdt(r["spike_ts"]) if r["spike_ts"] else None
+    return "spike" if sp and (now - sp).total_seconds() < 600 else "ok"
+
+
+# ---- MQTT ----
+def handle_mqtt_message(cfg: dict, topic: str, payload: bytes) -> tuple:
+    """JSON {"tp","ts","voltage","power_kw"[, "sig"]}; sig = HMAC-SHA256(secret, json(sort_keys, compact) без sig)."""
+    if len(payload) > 2048:
+        return False, "Занадто великий payload"
+    try:
+        d = json.loads(payload)
+        assert isinstance(d, dict)
+    except Exception:
+        return False, "Некоректний JSON"
+    secret = cfg.get("MQTT_HMAC_SECRET")
+    if secret:
+        sig = str(d.pop("sig", ""))
+        body = json.dumps(d, sort_keys=True, separators=(",", ":"))
+        if not hmac.compare_digest(hmac.new(secret.encode(), body.encode(), hashlib.sha256).hexdigest(), sig):
+            return False, "Невірний підпис повідомлення"
+    parts = topic.split("/")
+    tp = d.get("tp") or (parts[2] if len(parts) >= 3 else None)
+    n, err = ingest_readings([dict(tp=tp, ts=d.get("ts"), voltage=d.get("voltage"),
+                                   power_kw=d.get("power_kw"), source="mqtt")])
+    return n == 1, err
+
+
+def start_mqtt(cfg: dict, state: dict):
+    s_ = state["mqtt"]
+    try:
+        import paho.mqtt.client as mqtt
+    except ImportError:
+        s_.update(state="немає paho-mqtt", last="pip install paho-mqtt")
+        return
+    try:
+        client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)  # paho-mqtt 2.x
+    except AttributeError:
+        client = mqtt.Client()  # paho-mqtt 1.x
+    tls = str(cfg.get("MQTT_TLS", "true")).lower() != "false"
+    topic = cfg.get("MQTT_TOPIC") or "grid/tp/+/telemetry"
+    if cfg.get("MQTT_USER"):
+        client.username_pw_set(cfg["MQTT_USER"], cfg.get("MQTT_PASSWORD"))
+    if tls:
+        client.tls_set()
+
+    def on_connect(c, userdata, flags, rc, *a):
+        good = (rc == 0) if isinstance(rc, int) else not getattr(rc, "is_failure", False)
+        s_["state"] = "підключено" if good else f"помилка {rc}"
+        if good:
+            c.subscribe(topic)
+
+    def on_disconnect(c, userdata, *a):
+        s_["state"] = "відключено (перепідключення…)"
+
+    def on_message(c, userdata, msg):
+        good, info = handle_mqtt_message(cfg, msg.topic, msg.payload)
+        s_["ok" if good else "err"] += 1
+        if not good:
+            s_["last"] = info
+
+    client.on_connect, client.on_disconnect, client.on_message = on_connect, on_disconnect, on_message
+    client.reconnect_delay_set(1, 60)
+    s_["state"] = "підключення…"
+    client.connect_async(cfg["MQTT_HOST"], int(cfg.get("MQTT_PORT") or (8883 if tls else 1883)), 60)
+    client.loop_start()
+
+
+# ---- Modbus TCP ----
+def modbus_loop(cfg: dict, state: dict):
+    """MODBUS_DEVICES (JSON-рядок): [{"tp":"TP-VIN-1-1","host":"10.0.0.5","port":502,"unit":1,
+    "voltage_reg":0,"power_reg":1,"scale_v":0.1,"scale_p":0.1}]"""
+    s_ = state["modbus"]
+    try:
+        from pymodbus.client import ModbusTcpClient
+    except ImportError:
+        s_.update(state="немає pymodbus", last="pip install pymodbus")
+        return
+    try:
+        devices = json.loads(cfg["MODBUS_DEVICES"])
+    except Exception as e:
+        s_.update(state="помилка конфігурації", last=str(e)[:120])
+        return
+    s_["state"] = "працює"
+    while True:
+        for d in devices:
+            cl = None
+            try:
+                cl = ModbusTcpClient(d["host"], port=int(d.get("port", 502)), timeout=3)
+                if not cl.connect():
+                    raise ConnectionError(f"{d['host']}: немає з'єднання")
+
+                def read(addr):
+                    rr = None
+                    for kw in ("slave", "device_id", "unit"):  # різні версії pymodbus
+                        try:
+                            rr = cl.read_holding_registers(int(addr), count=1, **{kw: int(d.get("unit", 1))})
+                            break
+                        except TypeError:
+                            continue
+                    if rr is None or rr.isError():
+                        raise IOError(f"Помилка читання регістра {addr}")
+                    return rr.registers[0]
+
+                n, err = ingest_readings([dict(
+                    tp=d["tp"], ts=None, source="modbus",
+                    voltage=read(d["voltage_reg"]) * float(d.get("scale_v", 0.1)),
+                    power_kw=read(d["power_reg"]) * float(d.get("scale_p", 0.1)))])
+                s_["ok" if n else "err"] += 1
+                if err:
+                    s_["last"] = err
+            except Exception as e:
+                s_["err"] += 1
+                s_["last"] = str(e)[:120]
+            finally:
+                if cl:
+                    cl.close()
+        time.sleep(max(2, int(cfg.get("MODBUS_INTERVAL_SEC", 15))))
+
+
+# ---- симулятор розумних лічильників (демо) ----
+def sim_telemetry_loop(cfg: dict, state: dict):
+    s_, rng = state["sim"], random.Random()
+    s_["state"] = "працює"
+    while True:
+        try:
+            res, faults = grid_states(), json.loads(get_setting("tele_faults") or "{}")
+            now = datetime.now()
+            curve = 0.85 + 0.35 * math.sin((now.hour + now.minute / 60 - 14) / 24 * 2 * math.pi)
+            batch, used = [], []
+            for tp, g in GRID.items():
+                if g["type"] != "tp":
+                    continue
+                mode, base = faults.get(tp), g["customers"] * 0.18 * curve
+                if res[tp]["dark"] or mode == "dark":
+                    v, pw = rng.uniform(0, 2), 0.0
+                elif mode == "sag":
+                    v, pw = rng.uniform(165, 190), base * 0.8
+                elif mode == "spike":
+                    v, pw = rng.uniform(262, 280), base * 2.2
+                    used.append(tp)
+                else:
+                    v, pw = rng.gauss(230, 2.0), max(base * rng.uniform(0.92, 1.08), 0)
+                batch.append(dict(tp=tp, ts=None, voltage=v, power_kw=pw, source="sim"))
+            ok, err = ingest_readings(batch)
+            s_["ok"] += ok
+            if err:
+                s_["err"] += 1
+                s_["last"] = err
+            if used:  # стрибок — одноразовий
+                for tp in used:
+                    faults.pop(tp, None)
+                set_setting("tele_faults", json.dumps(faults))
+        except Exception as e:
+            s_["err"] += 1
+            s_["last"] = str(e)[:120]
+        time.sleep(max(1, int(cfg.get("TELEMETRY_INTERVAL_SEC", 10))))
+
+
+@st.cache_resource
+def start_iot(cfg_items: tuple):
+    cfg, state = dict(cfg_items), iot_state()
+    use_sim = cfg["DEMO"] and not (cfg.get("MQTT_HOST") or cfg.get("MODBUS_DEVICES"))
+    if cfg.get("MQTT_HOST"):
+        start_mqtt(cfg, state)
+    if cfg.get("MODBUS_DEVICES"):
+        threading.Thread(target=modbus_loop, args=(cfg, state), daemon=True, name="modbus").start()
+    if use_sim:
+        threading.Thread(target=sim_telemetry_loop, args=(cfg, state), daemon=True, name="sim-telemetry").start()
+    return True
+
+
+# ---- автовиявлення аварій ----
+def escalate_nodes(flags: set, feeder_need, sub_need) -> list:
+    """Підйом по ієрархії: ТП → фідер (якщо позначено достатньо ТП) → підстанція (якщо достатньо фідерів)."""
+    by_f = {}
+    for tp in flags:
+        by_f.setdefault(GRID[tp]["parent"], set()).add(tp)
+    feeders = {f for f, t in by_f.items() if len(t) >= feeder_need(f)}
+    by_s = {}
+    for f in feeders:
+        by_s.setdefault(GRID[f]["parent"], set()).add(f)
+    subs = {sb for sb, fs in by_s.items() if len(fs) >= sub_need(sb)}
+    return (list(subs) + [f for f in feeders if GRID[f]["parent"] not in subs]
+            + [tp for tp in flags if GRID[tp]["parent"] not in feeders])
+
+
+def complaint_tp_counts(window_min: int) -> dict:
+    since = iso_utc(datetime.now(timezone.utc) - timedelta(minutes=window_min))
+    by_tp = {}
+    for r in q("SELECT r.id, r.line_id, c.account, c.line_id AS cline FROM reports r "
+               "LEFT JOIN consumers c ON c.id=r.consumer_id WHERE r.ts>? AND r.status='new'", (since,)):
+        if r["account"] and r["cline"] in GRID:
+            tp = tp_of(r["account"], r["cline"])
+        elif r["line_id"] in GRID and GRID[r["line_id"]]["type"] == "tp":
+            tp = r["line_id"]
+        else:
+            continue
+        by_tp.setdefault(tp, []).append(r["id"])
+    return by_tp
+
+
+def log_auto(source: str, node: str, detail: str):
+    with DB_LOCK, db() as con:
+        con.execute("INSERT INTO auto_log(ts,source,node,detail) VALUES(?,?,?,?)", (now_iso(), source, node, detail))
+
+
+def create_auto_incident(cfg: dict, node: str, source: str, reason: str) -> str:
+    now = now_iso()
+    kids = [r for r in q("SELECT * FROM incidents WHERE id LIKE 'AUTO-%' AND status='active'")
+            if r["line_id"] in GRID and r["line_id"] != node and node in ancestors(r["line_id"])]
+    starts = min([now] + [k["starts_at"] for k in kids if k["starts_at"]], key=lambda v: pdt(v) or datetime.max.replace(tzinfo=timezone.utc))
+    if kids:  # нижчі автоінциденти поглинаються вищим (щоб не двічі рахувати в SAIDI)
+        with DB_LOCK, db() as con:
+            for k in kids:
+                con.execute("DELETE FROM incidents WHERE id=?", (k["id"],))
+                con.execute("DELETE FROM interruptions WHERE incident_id=?", (k["id"],))
+    inc = dict(id=f"AUTO-{source}-{datetime.now().strftime('%y%m%d%H%M%S')}-{node}", line_id=node, kind="outage",
+               title=f"Автовиявлена аварія: {GRID[node]['name']}", description=reason, starts_at=starts,
+               ends_at=None, status="active", updated_at=now)
+    with DB_LOCK, db() as con:
+        con.execute("INSERT OR REPLACE INTO incidents VALUES(:id,:line_id,:kind,:title,:description,:starts_at,"
+                    ":ends_at,:status,:updated_at)", inc)
+    track_interruption(inc)
+    notify_for(cfg, inc)
+    log_auto(source, node, reason)
+    return inc["id"]
+
+
+def resolve_auto(cfg: dict, inc: dict, why: str = "відновлення напруги"):
+    inc = dict(inc, status="resolved", updated_at=now_iso())
+    with DB_LOCK, db() as con:
+        con.execute("UPDATE incidents SET status='resolved', updated_at=? WHERE id=?", (inc["updated_at"], inc["id"]))
+    track_interruption(inc)
+    notify_for(cfg, inc)
+    log_auto("close", inc["line_id"], f"{inc['id']}: {why}")
+
+
+def auto_detect(cfg: dict) -> list:
+    """Автоматичне створення аварійних інцидентів без участі диспетчера:
+    1) > N скарг від однієї ТП за вікно (5 хв) → інцидент на ТП; підйом на фідер/підстанцію при кількох ТП;
+    2) втрата напруги за даними розумних лічильників понад N с → інцидент (також з підйомом по ієрархії)."""
+    if get_setting("auto_enabled") != "1":
+        return []
+    made = []
+    with AUTO_LOCK:
+        def covered(node):
+            act = {r["line_id"] for r in q("SELECT line_id FROM incidents WHERE status='active'")}
+            return any(a in act for a in ancestors(node))
+
+        n, win = int(get_setting("auto_n")), int(get_setting("auto_window_min"))
+        by_tp = complaint_tp_counts(win)
+        flagged = {tp for tp, ids in by_tp.items() if len(ids) > n}
+        for node in escalate_nodes(flagged, lambda f: 2, lambda sb: 2):
+            if covered(node):
+                continue
+            tps = [t for t in tps_under(node) if t in flagged]
+            ids = [i for t in tps for i in by_tp[t]]
+            iid = create_auto_incident(cfg, node, "C", f"Автоматично за скаргами: {len(ids)} скарг за {win} хв "
+                                       f"від {len(tps)} ТП (поріг: більше {n} на ТП).")
+            with DB_LOCK, db() as con:
+                con.executemany("UPDATE reports SET status='in_progress' WHERE id=?", [(i,) for i in ids])
+            made.append(f"🚨 {iid}")
+
+        now = datetime.now(timezone.utc)
+        conf, stale = int(get_setting("tele_confirm_sec")), int(get_setting("tele_stale_min"))
+        rows = {r["tp_id"]: r for r in q("SELECT * FROM telemetry_latest") if r["tp_id"] in GRID}
+
+        def fresh(r):
+            t = pdt(r["ts"])
+            return bool(t) and (now - t).total_seconds() < stale * 60
+
+        lost = {tp for tp, r in rows.items() if r["low_since"] and fresh(r)
+                and (now - (pdt(r["low_since"]) or now)).total_seconds() >= conf}
+        for node in escalate_nodes(lost, lambda f: len(tps_under(f)), lambda sb: len(feeders_under(sb))):
+            if covered(node):
+                continue
+            k = len([t for t in tps_under(node) if t in lost])
+            iid = create_auto_incident(cfg, node, "T", f"Автоматично за телеметрією: напруга відсутня понад {conf} с "
+                                       f"на {k} ТП (розумні лічильники/SCADA).")
+            made.append(f"⚡ {iid}")
+        for r in q("SELECT * FROM incidents WHERE id LIKE 'AUTO-T-%' AND status='active'"):
+            tps = tps_under(r["line_id"]) if r["line_id"] in GRID else ()
+            if tps and all(t in rows and rows[t]["low_since"] is None and fresh(rows[t]) for t in tps):
+                resolve_auto(cfg, dict(r))
+                made.append(f"✅ {r['id']} закрито автоматично")
+    return made
+
+
+# ---- інтерфейс вкладки ----
+def telemetry_map(df: pd.DataFrame) -> pdk.Deck:
+    data = pd.DataFrame([dict(lon=GRID[r.tp]["lon"], lat=GRID[r.tp]["lat"], color=TELE_COLORS[r.status],
+                              tip=f"<b>{GRID[r.tp]['name']}</b><br/>{TELE_LABELS[r.status]}<br/>"
+                                  f"U = {r._4} В · P = {r._5} кВт")
+                         for r in df.itertuples()])
+    layer = pdk.Layer("ScatterplotLayer", data=data, pickable=True, get_position="[lon, lat]",
+                      get_fill_color="color", get_radius=450, radius_min_pixels=4, radius_max_pixels=11)
+    return pdk.Deck(layers=[layer], map_style="light", tooltip={"html": "{tip}"},
+                    initial_view_state=pdk.ViewState(latitude=49.05, longitude=28.5, zoom=7.2))
+
+
+def iot_tab(cfg):
+    state = iot_state()
+    st.markdown("**Інтеграція з IoT / SCADA: розумні лічильники (AMI), MQTT, Modbus TCP**")
+    for col, (key, label) in zip(st.columns(3), [("sim", "Симулятор лічильників (демо)"), ("mqtt", "MQTT"),
+                                                 ("modbus", "Modbus TCP")]):
+        s_ = state[key]
+        col.metric(label, s_["state"], f"✓ {s_['ok']} · ✗ {s_['err']}", delta_color="off")
+        if s_["last"]:
+            col.caption(f"Остання помилка: {s_['last']}")
+    now, loss_v, stale = datetime.now(timezone.utc), float(get_setting("tele_loss_v")), int(get_setting("tele_stale_min"))
+    rows = [r for r in q("SELECT * FROM telemetry_latest") if r["tp_id"] in GRID]
+    df = pd.DataFrame([dict(tp=r["tp_id"], ТП=GRID[r["tp_id"]]["name"], Район=tp_raion(r["tp_id"]),
+                            U=round(r["voltage"], 1), P=round(r["power_kw"], 1), Оновлено=fmt_dt(r["ts"]),
+                            Джерело=r["source"], status=tele_status(r, now, loss_v, stale)) for r in rows],
+                      columns=["tp", "ТП", "Район", "U", "P", "Оновлено", "Джерело", "status"])
+    if df.empty:
+        st.info("Телеметрії поки немає. Налаштуйте MQTT/Modbus у secrets або дочекайтеся даних симулятора.")
+    else:
+        cnt = df["status"].value_counts()
+        k = st.columns(5)
+        k[0].metric("ТП на зв'язку", f"{len(df) - cnt.get('nocomm', 0)}/{len(GRID_TPS)}")
+        k[1].metric("Без напруги", int(cnt.get("dark", 0)))
+        k[2].metric("Відхилення напруги", int(cnt.get("low", 0) + cnt.get("high", 0) + cnt.get("spike", 0)))
+        k[3].metric("Немає зв'язку", int(cnt.get("nocomm", 0)))
+        k[4].metric("Навантаження", f"{df.loc[df['status'] != 'dark', 'P'].sum() / 1000:.2f} МВт")
+        pick = st.multiselect("Показати стани", list(TELE_LABELS), default=list(TELE_LABELS), format_func=TELE_LABELS.get,
+                              key="tele_filter")
+        view = df[df["status"].isin(pick)]
+        if not view.empty:
+            st.pydeck_chart(telemetry_map(view), use_container_width=True)
+            order = {k_: i for i, k_ in enumerate(["dark", "nocomm", "spike", "low", "high", "ok"])}
+            tbl = view.sort_values("status", key=lambda c: c.map(order)).assign(Стан=lambda x: x["status"].map(TELE_LABELS))
+            st.dataframe(tbl[["ТП", "Район", "U", "P", "Стан", "Оновлено", "Джерело"]].rename(
+                columns={"U": "Напруга, В", "P": "Потужність, кВт"}), use_container_width=True, hide_index=True)
+        tp = st.selectbox("Графік вибраної ТП (3 год)", df["tp"].tolist(), format_func=lambda i: GRID[i]["name"], key="tele_tp")
+        h = qdf("SELECT ts, voltage, power_kw FROM telemetry_log WHERE tp_id=? AND ts>? ORDER BY ts",
+                (tp, iso_utc(now - timedelta(hours=3))))
+        if px is not None and not h.empty:
+            h["ts"] = pd.to_datetime(h["ts"], utc=True).dt.tz_convert(None)
+            fig = make_subplots(specs=[[{"secondary_y": True}]])
+            fig.add_scatter(x=h["ts"], y=h["voltage"], name="Напруга, В", line=dict(color="#1f77b4"))
+            fig.add_scatter(x=h["ts"], y=h["power_kw"], name="Потужність, кВт", line=dict(color="#e57300"), secondary_y=True)
+            fig.update_layout(template="plotly_white", height=300, margin=dict(t=20, b=20), legend=dict(orientation="h", y=1.15))
+            st.plotly_chart(fig, use_container_width=True)
+
+    with st.expander("⚙️ Автовиявлення аварій (без участі диспетчера)", expanded=True):
+        a1, a2, a3 = st.columns(3)
+        en = a1.toggle("Автоінциденти увімкнено", get_setting("auto_enabled") == "1")
+        n = a2.number_input("N: поріг скарг на ТП (інцидент при > N)", 1, 50, int(get_setting("auto_n")))
+        win = a3.number_input("Вікно скарг, хв", 1, 60, int(get_setting("auto_window_min")))
+        b1, b2, b3 = st.columns(3)
+        conf = b1.number_input("Підтвердження втрати напруги, с", 5, 600, int(get_setting("tele_confirm_sec")))
+        lv = b2.number_input("Поріг «немає напруги», В", 5, 150, int(float(get_setting("tele_loss_v"))))
+        stl = b3.number_input("«Немає зв'язку» після, хв", 1, 60, int(get_setting("tele_stale_min")))
+        if st.button("💾 Зберегти налаштування"):
+            for key, val in (("auto_enabled", int(en)), ("auto_n", n), ("auto_window_min", win), ("tele_confirm_sec", conf),
+                             ("tele_loss_v", lv), ("tele_stale_min", stl)):
+                set_setting(key, val)
+            st.success("Збережено")
+        st.caption("Правила: (1) більше N скарг від однієї ТП за вікно → аварія на ТП; ≥2 ТП одного фідера → аварія фідера; "
+                   "≥2 фідерів однієї підстанції → аварія підстанції. (2) напруга < порогу понад N с за даними лічильників — "
+                   "те саме з підйомом по ієрархії; автоінциденти за телеметрією закриваються при відновленні напруги, "
+                   "за скаргами — закриває диспетчер.")
+    auto = q("SELECT * FROM incidents WHERE id LIKE 'AUTO-%' ORDER BY updated_at DESC LIMIT 50")
+    if auto:
+        st.markdown("**Автоінциденти**")
+        st.dataframe(pd.DataFrame([{"ID": r["id"], "Вузол": line_label(r["line_id"]), "Статус": STATUSES[r["status"]],
+                                    "Початок": fmt_dt(r["starts_at"]), "Підстава": r["description"]} for r in auto]),
+                     use_container_width=True, hide_index=True)
+        act = [r["id"] for r in auto if r["status"] == "active"]
+        c1, c2 = st.columns([3, 1])
+        cid = c1.selectbox("Закрити автоінцидент", [""] + act, key="auto_close")
+        if cid and c2.button("✅ Закрити та сповістити"):
+            resolve_auto(cfg, dict(next(r for r in auto if r["id"] == cid)), "закрито диспетчером")
+            st.rerun()
+    lg = qdf("SELECT ts AS Час, source AS Джерело, node AS Вузол, detail AS Деталі FROM auto_log ORDER BY id DESC LIMIT 20")
+    if not lg.empty:
+        with st.expander("📜 Журнал автоматичних дій"):
+            lg["Час"] = lg["Час"].map(fmt_dt)
+            st.dataframe(lg, use_container_width=True, hide_index=True)
+
+    if cfg["DEMO"]:
+        with st.expander("🧪 Імітація подій на пристроях (демо)"):
+            node = node_picker("iot")
+
+            def set_faults(mode):
+                faults = json.loads(get_setting("tele_faults") or "{}")
+                for t in tps_under(node):
+                    faults.pop(t, None)
+                    if mode:
+                        faults[t] = mode
+                set_setting("tele_faults", json.dumps(faults))
+
+            f1, f2, f3, f4 = st.columns(4)
+            if f1.button("⚡ Втрата напруги"):
+                set_faults("dark")
+                st.success(f"Напруги немає на {len(tps_under(node))} ТП. Автоінцидент з'явиться після підтвердження.")
+            if f2.button("📉 Просадка"):
+                set_faults("sag")
+            if f3.button("📈 Стрибок"):
+                set_faults("spike")
+            if f4.button("✅ Відновити"):
+                set_faults(None)
+                st.success("Живлення відновлено у симуляторі.")
+
+
+GRID_TPS = [i for i, g in GRID.items() if g["type"] == "tp"]
+
+
 def oblast_map():
     st.subheader("Карта мережі Вінницької області")
 
@@ -1341,6 +1877,7 @@ def main():
     if cfg["DEMO"] and q("SELECT COUNT(*) AS n FROM interruptions")[0]["n"] == 0:
         seed_history()
     start_poller(tuple(sorted(cfg.items())))
+    start_iot(tuple(sorted(cfg.items())))
 
     st.title("⚡ Сервіс інформування споживачів — Вінницька область")
     st.caption("Автоматичні сповіщення про планові ремонти та аварії на вашій лінії мережі "
