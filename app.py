@@ -47,6 +47,8 @@ DB_LOCK = threading.RLock()
 MAX_SKEW_SEC = 300
 KINDS = {"outage": "🚨 Аварія", "planned": "🛠️ Плановий ремонт"}
 STATUSES = {"active": "Триває", "scheduled": "Заплановано", "resolved": "Усунено"}
+REPORT_STATUS = {"new": "Нове", "in_progress": "В роботі", "closed": "Закрито"}
+REPORT_CATEGORIES = ["Немає електропостачання", "Низька/нестабільна напруга", "Пошкодження обладнання", "Інше"]
 DEMO_SECRET = "demo-secret-change-me"
 ADMIN_PASSWORD = "Vinnytsia2026"  # пароль диспетчера за замовчуванням (можна перевизначити через secrets)
 
@@ -129,6 +131,9 @@ def init_db():
             id INTEGER PRIMARY KEY, ts TEXT, incident_id TEXT, consumer_id INT, channel TEXT,
             event_key TEXT, status TEXT, detail TEXT,
             UNIQUE(incident_id, consumer_id, channel, event_key));
+        CREATE TABLE IF NOT EXISTS reports(
+            id INTEGER PRIMARY KEY, ts TEXT, consumer_id INT, line_id TEXT, category TEXT,
+            text TEXT, status TEXT DEFAULT 'new');
         CREATE TABLE IF NOT EXISTS poll_log(
             id INTEGER PRIMARY KEY, ts TEXT, ok INT, message TEXT);
         """)
@@ -340,52 +345,225 @@ def incident_cards(rows):
             f"_Оновлено: {fmt_dt(r['updated_at'])}_")
 
 
+def q(sql, params=()):
+    with DB_LOCK, db() as con:
+        return con.execute(sql, params).fetchall()
+
+
+def qdf(sql, params=()) -> pd.DataFrame:
+    with DB_LOCK, db() as con:
+        return pd.read_sql(sql, con, params=params)
+
+
+def until(s) -> str:
+    try:
+        sec = int((datetime.fromisoformat(s) - datetime.now(timezone.utc)).total_seconds())
+    except Exception:
+        return "—"
+    if sec <= 0:
+        return "розпочато"
+    days, rem = divmod(sec, 86400)
+    return f"{days} д {rem // 3600} г" if days else f"{rem // 3600} г {rem % 3600 // 60} хв"
+
+
+def span(a, b) -> str:
+    try:
+        sec = max(int((datetime.fromisoformat(b) - datetime.fromisoformat(a)).total_seconds()), 0)
+    except Exception:
+        return "—"
+    return f"{sec // 3600} г {sec % 3600 // 60} хв"
+
+
+def test_channels(cfg, c) -> list[str]:
+    subj, body = "🔔 Тестове сповіщення", f"Це перевірка каналів зв'язку для {c['name']} ({c['address']})."
+    out = []
+    for name, on, fn in (("Email", c["ch_email"], lambda: send_email(cfg, c["email"], subj, body)),
+                         ("SMS", c["ch_sms"], lambda: f"імітація SMS на {c['phone'] or '—'}"),
+                         ("Telegram", c["ch_tg"], lambda: send_telegram(cfg, c["telegram_chat"], subj, body))):
+        if not on:
+            continue
+        try:
+            out.append(f"✅ {name}: {fn()}")
+        except Exception as e:
+            out.append(f"❌ {name}: {str(e)[:120]}")
+    return out or ["Жоден канал не увімкнено."]
+
+
 def consumer_portal():
+    cfg = load_config()
     st.subheader("Кабінет споживача")
     if "consumer_id" not in st.session_state:
         with st.form("login"):
             acc = st.text_input("Номер особового рахунку")
             pin = st.text_input("PIN-код", type="password")
             if st.form_submit_button("Увійти"):
-                with DB_LOCK, db() as con:
-                    c = con.execute("SELECT * FROM consumers WHERE account=?", (acc.strip(),)).fetchone()
-                ok = c and hmac.compare_digest(hash_pin(pin, c["salt"]), c["pin_hash"])
-                if ok:
+                rows = q("SELECT * FROM consumers WHERE account=?", (acc.strip(),))
+                c = rows[0] if rows else None
+                if c and hmac.compare_digest(hash_pin(pin, c["salt"]), c["pin_hash"]):
                     st.session_state.consumer_id = c["id"]
                     st.rerun()
                 time.sleep(1)  # уповільнення підбору PIN
                 st.error("Невірний рахунок або PIN")
-        st.caption("Демо: рахунок 1001, PIN 1234" if load_config()["DEMO"] else "")
+        st.caption("Демо: рахунок 1001, PIN 1234" if cfg["DEMO"] else "")
         return
-    with DB_LOCK, db() as con:
-        c = con.execute("SELECT * FROM consumers WHERE id=?", (st.session_state.consumer_id,)).fetchone()
-    st.write(f"👤 **{c['name']}** · {c['address']} · лінія **{line_label(c['line_id'])}**")
-    if st.button("Вийти"):
+
+    rows = q("SELECT * FROM consumers WHERE id=?", (st.session_state.consumer_id,))
+    if not rows:
+        del st.session_state["consumer_id"]
+        st.rerun()
+    c = rows[0]
+    code = LINES.get(c["line_id"])
+    raion = SETTLEMENTS[code][1] if code else "—"
+    h1, h2 = st.columns([5, 1])
+    h1.markdown(f"#### 👤 {c['name']}")
+    h1.caption(f"Рахунок {c['account']} · {c['address']} · {raion} район · лінія {line_label(c['line_id'])}")
+    if h2.button("Вийти"):
         del st.session_state["consumer_id"]
         st.rerun()
 
-    @st.fragment(run_every=5)
-    def live():
-        with DB_LOCK, db() as con:
-            rows = con.execute("SELECT * FROM incidents WHERE line_id=? ORDER BY "
-                               "(status='resolved'), updated_at DESC", (c["line_id"],)).fetchall()
-        incident_cards(rows)
+    tabs = st.tabs(["🏠 Поточний стан", "📅 Графік робіт", "🗂️ Історія", "🔔 Сповіщення",
+                    "📝 Звернення", "⚙️ Профіль"])
 
-    live()
-    with st.expander("⚙️ Канали сповіщень"):
-        e = st.checkbox("Email", bool(c["ch_email"]))
-        s = st.checkbox("SMS", bool(c["ch_sms"]))
-        t = st.checkbox("Telegram", bool(c["ch_tg"]))
-        if st.button("Зберегти налаштування"):
-            with DB_LOCK, db() as con:
-                con.execute("UPDATE consumers SET ch_email=?,ch_sms=?,ch_tg=? WHERE id=?",
-                            (int(e), int(s), int(t), c["id"]))
-            st.toast("Збережено")
-    with st.expander("📜 Мої сповіщення"):
-        with DB_LOCK, db() as con:
-            df = pd.read_sql("SELECT ts,incident_id,channel,status,detail FROM notif_log "
-                             "WHERE consumer_id=? ORDER BY id DESC LIMIT 50", con, params=(c["id"],))
-        st.dataframe(df, use_container_width=True, hide_index=True)
+    with tabs[0]:
+        @st.fragment(run_every=5)
+        def live():
+            ev = q("SELECT * FROM incidents WHERE line_id=? AND status!='resolved' "
+                   "ORDER BY (kind='outage') DESC, updated_at DESC", (c["line_id"],))
+            active = [r for r in ev if r["status"] == "active"]
+            plan = [r for r in ev if r["status"] == "scheduled"]
+            k1, k2, k3 = st.columns(3)
+            k1.metric("Стан лінії", "🔴 Аварія" if any(r["kind"] == "outage" for r in active)
+                      else "🟠 Ремонт" if active else "🟢 Норма")
+            k2.metric("Активні події", len(active))
+            k3.metric("Найближчі роботи", until(min(r["starts_at"] for r in plan)) if plan else "—")
+            incident_cards(ev)
+            st.caption(f"Оновлено {datetime.now().strftime('%H:%M:%S')} · автооновлення кожні 5 с")
+
+        live()
+
+    with tabs[1]:
+        plan = q("SELECT * FROM incidents WHERE line_id=? AND kind='planned' AND status='scheduled' "
+                 "ORDER BY starts_at", (c["line_id"],))
+        st.markdown("**Заплановані роботи на вашій лінії**")
+        if plan:
+            st.dataframe(pd.DataFrame([{"Робота": r["title"], "Початок": fmt_dt(r["starts_at"]),
+                                        "Завершення": fmt_dt(r["ends_at"]),
+                                        "Тривалість": span(r["starts_at"], r["ends_at"]),
+                                        "Через": until(r["starts_at"])} for r in plan]),
+                         use_container_width=True, hide_index=True)
+        else:
+            st.success("Планових відключень не заплановано.")
+        if code:
+            others = [l for l in LINES if LINES[l] == code and l != c["line_id"]]
+            near = q(f"SELECT * FROM incidents WHERE status!='resolved' AND line_id IN "
+                     f"({','.join('?' * len(others))})", others)
+            st.markdown(f"**Інші лінії: {SETTLEMENTS[code][0]}**")
+            if near:
+                st.dataframe(pd.DataFrame([{"Лінія": r["line_id"], "Тип": KINDS[r["kind"]],
+                                            "Подія": r["title"], "Статус": STATUSES[r["status"]]}
+                                           for r in near]), use_container_width=True, hide_index=True)
+            else:
+                st.caption("На інших лініях вашого населеного пункту подій немає.")
+
+    with tabs[2]:
+        hist = q("SELECT * FROM incidents WHERE line_id=? ORDER BY updated_at DESC", (c["line_id"],))
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Усього подій", len(hist))
+        m2.metric("Аварій", sum(r["kind"] == "outage" for r in hist))
+        m3.metric("Планових робіт", sum(r["kind"] == "planned" for r in hist))
+        f1, f2 = st.columns(2)
+        kinds = f1.multiselect("Тип", list(KINDS), default=list(KINDS), format_func=KINDS.get)
+        sts = f2.multiselect("Статус", list(STATUSES), default=list(STATUSES), format_func=STATUSES.get)
+        data = [{"Подія": r["title"], "Тип": KINDS[r["kind"]], "Статус": STATUSES[r["status"]],
+                 "Початок": fmt_dt(r["starts_at"]), "Завершення": fmt_dt(r["ends_at"]),
+                 "Тривалість": span(r["starts_at"], r["updated_at"] if r["status"] == "resolved" else r["ends_at"]),
+                 "Оновлено": fmt_dt(r["updated_at"])}
+                for r in hist if r["kind"] in kinds and r["status"] in sts]
+        if data:
+            df = pd.DataFrame(data)
+            st.dataframe(df, use_container_width=True, hide_index=True)
+            st.download_button("⬇️ Завантажити CSV", df.to_csv(index=False).encode("utf-8-sig"),
+                               "history.csv", "text/csv")
+        else:
+            st.info("Подій за обраними фільтрами немає.")
+
+    with tabs[3]:
+        df = qdf("SELECT n.ts AS Час, i.title AS Подія, n.channel AS Канал, n.status AS Статус, "
+                 "n.detail AS Деталі FROM notif_log n LEFT JOIN incidents i ON i.id=n.incident_id "
+                 "WHERE n.consumer_id=? ORDER BY n.id DESC LIMIT 200", (c["id"],))
+        if df.empty:
+            st.info("Сповіщень поки немає.")
+        else:
+            chans = st.multiselect("Канал", sorted(df["Канал"].unique()), default=sorted(df["Канал"].unique()))
+            st.dataframe(df[df["Канал"].isin(chans)], use_container_width=True, hide_index=True)
+        if st.button("📨 Надіслати тестове сповіщення"):
+            for line in test_channels(cfg, c):
+                st.write(line)
+
+    with tabs[4]:
+        with st.form("report", clear_on_submit=True):
+            cat = st.selectbox("Тема звернення", REPORT_CATEGORIES)
+            txt = st.text_area("Опишіть проблему", max_chars=1000)
+            if st.form_submit_button("Надіслати диспетчеру"):
+                recent = q("SELECT COUNT(*) AS n FROM reports WHERE consumer_id=? AND ts>?",
+                           (c["id"], (datetime.now(timezone.utc) - timedelta(hours=1)).replace(microsecond=0).isoformat()))[0]["n"]
+                if len(txt.strip()) < 5:
+                    st.error("Опишіть проблему (мінімум 5 символів)")
+                elif recent >= 5:
+                    st.error("Ліміт: не більше 5 звернень на годину")
+                else:
+                    with DB_LOCK, db() as con:
+                        con.execute("INSERT INTO reports(ts,consumer_id,line_id,category,text) VALUES(?,?,?,?,?)",
+                                    (now_iso(), c["id"], c["line_id"], cat, txt.strip()))
+                    st.success("Звернення надіслано")
+        mine = qdf("SELECT id AS №, ts AS Час, category AS Тема, text AS Опис, status AS Статус "
+                   "FROM reports WHERE consumer_id=? ORDER BY id DESC LIMIT 50", (c["id"],))
+        if not mine.empty:
+            mine["Статус"] = mine["Статус"].map(REPORT_STATUS)
+            mine["Час"] = mine["Час"].map(fmt_dt)
+            st.dataframe(mine, use_container_width=True, hide_index=True)
+
+    with tabs[5]:
+        with st.form("profile"):
+            a, b = st.columns(2)
+            email = a.text_input("Email", c["email"] or "")
+            phone = b.text_input("Телефон", c["phone"] or "")
+            tg = a.text_input("Telegram chat_id", c["telegram_chat"] or "")
+            st.write("Канали сповіщень")
+            e = st.checkbox("Email", bool(c["ch_email"]))
+            sm = st.checkbox("SMS", bool(c["ch_sms"]))
+            t = st.checkbox("Telegram", bool(c["ch_tg"]))
+            if st.form_submit_button("Зберегти"):
+                email, phone, tg = email.strip(), phone.strip(), tg.strip()
+                if email and "@" not in email:
+                    st.error("Некоректний email")
+                elif (e and not email) or (sm and not phone) or (t and not tg):
+                    st.error("Для кожного увімкненого каналу вкажіть контакт")
+                else:
+                    with DB_LOCK, db() as con:
+                        con.execute("UPDATE consumers SET email=?,phone=?,telegram_chat=?,ch_email=?,ch_sms=?,"
+                                    "ch_tg=? WHERE id=?", (email, phone, tg, int(e), int(sm), int(t), c["id"]))
+                    st.toast("Профіль збережено")
+                    st.rerun()
+        with st.expander("🔑 Змінити PIN-код"):
+            with st.form("pin"):
+                old = st.text_input("Поточний PIN", type="password")
+                new = st.text_input("Новий PIN (мін. 4 цифри)", type="password")
+                new2 = st.text_input("Повторіть новий PIN", type="password")
+                if st.form_submit_button("Змінити PIN"):
+                    if not hmac.compare_digest(hash_pin(old, c["salt"]), c["pin_hash"]):
+                        time.sleep(1)
+                        st.error("Поточний PIN невірний")
+                    elif len(new) < 4 or not new.isdigit():
+                        st.error("Новий PIN: щонайменше 4 цифри")
+                    elif new != new2:
+                        st.error("PIN-коди не збігаються")
+                    else:
+                        salt = os.urandom(16).hex()
+                        with DB_LOCK, db() as con:
+                            con.execute("UPDATE consumers SET salt=?, pin_hash=? WHERE id=?",
+                                        (salt, hash_pin(new, salt), c["id"]))
+                        st.success("PIN змінено")
 
 
 def admin_panel(cfg):
@@ -406,7 +584,8 @@ def admin_panel(cfg):
         return
     if cfg["ADMIN_PASSWORD"] == ADMIN_PASSWORD:
         st.warning("Пароль вшито в код — для безпеки задайте ADMIN_PASSWORD у secrets.")
-    t1, t2, t3, t4 = st.tabs(["📡 Моніторинг", "👥 Споживачі", "📨 Журнал сповіщень", "🧪 Симулятор"])
+    t1, t2, t3, t4, t5 = st.tabs(["📡 Моніторинг", "👥 Споживачі", "📨 Журнал сповіщень", "🧪 Симулятор",
+                                   "📝 Звернення"])
 
     with t1:
         c1, c2 = st.columns([1, 3])
@@ -474,6 +653,22 @@ def admin_panel(cfg):
             if rid and st.button("✅ Позначити усуненою"):
                 sim.resolve(rid)
                 st.success("Статус оновлено")
+
+    with t5:
+        df = qdf("SELECT r.id, r.ts, c.account, c.name, r.line_id, r.category, r.text, r.status FROM reports r "
+                 "JOIN consumers c ON c.id=r.consumer_id ORDER BY r.id DESC LIMIT 200")
+        if df.empty:
+            st.info("Звернень поки немає.")
+        else:
+            st.dataframe(df.assign(status=df["status"].map(REPORT_STATUS)), use_container_width=True,
+                         hide_index=True)
+            r1, r2, r3 = st.columns(3)
+            rid = r1.selectbox("Звернення №", df["id"].tolist())
+            new = r2.selectbox("Статус", list(REPORT_STATUS), format_func=REPORT_STATUS.get)
+            if r3.button("Оновити статус"):
+                with DB_LOCK, db() as con:
+                    con.execute("UPDATE reports SET status=? WHERE id=?", (new, int(rid)))
+                st.rerun()
 
 
 def oblast_map():
