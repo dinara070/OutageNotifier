@@ -1537,7 +1537,9 @@ def sim_telemetry_loop(cfg: dict, state: dict):
     s_["state"] = "працює"
     while True:
         try:
-            res, faults = grid_states(), json.loads(get_setting("tele_faults") or "{}")
+            # фізика мережі: знеструмлення лише від подій центру, не від автоінцидентів (інакше зворотний зв'язок)
+            res = grid_states(q("SELECT * FROM incidents WHERE status!='resolved' AND id NOT LIKE 'AUTO-%'"))
+            faults = json.loads(get_setting("tele_faults") or "{}")
             now = datetime.now()
             curve = 0.85 + 0.35 * math.sin((now.hour + now.minute / 60 - 14) / 24 * 2 * math.pi)
             batch, used = [], []
@@ -1704,7 +1706,7 @@ def auto_detect(cfg: dict) -> list:
 def telemetry_map(df: pd.DataFrame) -> pdk.Deck:
     data = pd.DataFrame([dict(lon=GRID[r.tp]["lon"], lat=GRID[r.tp]["lat"], color=TELE_COLORS[r.status],
                               tip=f"<b>{GRID[r.tp]['name']}</b><br/>{TELE_LABELS[r.status]}<br/>"
-                                  f"U = {r._4} В · P = {r._5} кВт")
+                                  f"U = {r.U} В · P = {r.P} кВт")
                          for r in df.itertuples()])
     layer = pdk.Layer("ScatterplotLayer", data=data, pickable=True, get_position="[lon, lat]",
                       get_fill_color="color", get_radius=450, radius_min_pixels=4, radius_max_pixels=11)
@@ -1758,14 +1760,17 @@ def iot_tab(cfg):
             st.plotly_chart(fig, use_container_width=True)
 
     with st.expander("⚙️ Автовиявлення аварій (без участі диспетчера)", expanded=True):
+        def sv(key, lo, hi):  # значення з БД у межах віджета (захист від виходу за межі)
+            return min(max(int(float(get_setting(key))), lo), hi)
+
         a1, a2, a3 = st.columns(3)
         en = a1.toggle("Автоінциденти увімкнено", get_setting("auto_enabled") == "1")
-        n = a2.number_input("N: поріг скарг на ТП (інцидент при > N)", 1, 50, int(get_setting("auto_n")))
-        win = a3.number_input("Вікно скарг, хв", 1, 60, int(get_setting("auto_window_min")))
+        n = a2.number_input("N: поріг скарг на ТП (інцидент при > N)", 1, 50, sv("auto_n", 1, 50))
+        win = a3.number_input("Вікно скарг, хв", 1, 60, sv("auto_window_min", 1, 60))
         b1, b2, b3 = st.columns(3)
-        conf = b1.number_input("Підтвердження втрати напруги, с", 5, 600, int(get_setting("tele_confirm_sec")))
-        lv = b2.number_input("Поріг «немає напруги», В", 5, 150, int(float(get_setting("tele_loss_v"))))
-        stl = b3.number_input("«Немає зв'язку» після, хв", 1, 60, int(get_setting("tele_stale_min")))
+        conf = b1.number_input("Підтвердження втрати напруги, с", 1, 600, sv("tele_confirm_sec", 1, 600))
+        lv = b2.number_input("Поріг «немає напруги», В", 5, 150, sv("tele_loss_v", 5, 150))
+        stl = b3.number_input("«Немає зв'язку» після, хв", 1, 60, sv("tele_stale_min", 1, 60))
         if st.button("💾 Зберегти налаштування"):
             for key, val in (("auto_enabled", int(en)), ("auto_n", n), ("auto_window_min", win), ("tele_confirm_sec", conf),
                              ("tele_loss_v", lv), ("tele_stale_min", stl)):
