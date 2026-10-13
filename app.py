@@ -398,6 +398,8 @@ def admin_panel(cfg):
                 st.rerun()
             time.sleep(1)
             st.error("Невірний пароль")
+        if cfg["ADMIN_PASSWORD"] == ADMIN_PASSWORD:
+            st.caption(f"Демо: пароль диспетчера {ADMIN_PASSWORD} (англійська розкладка, регістр важливий)")
         return
     if cfg["ADMIN_PASSWORD"] == ADMIN_PASSWORD:
         st.warning("Пароль вшито в код — для безпеки задайте ADMIN_PASSWORD у secrets.")
