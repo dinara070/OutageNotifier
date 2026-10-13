@@ -48,6 +48,7 @@ MAX_SKEW_SEC = 300
 KINDS = {"outage": "🚨 Аварія", "planned": "🛠️ Плановий ремонт"}
 STATUSES = {"active": "Триває", "scheduled": "Заплановано", "resolved": "Усунено"}
 DEMO_SECRET = "demo-secret-change-me"
+ADMIN_PASSWORD = "Vinnytsia2026"  # пароль диспетчера за замовчуванням (можна перевизначити через secrets)
 
 # Населені пункти Вінницької області (код лінії: назва, район, широта, довгота).
 # Координати та належність до районів (після реформи 2020 р.) орієнтовні — уточніть за потреби.
@@ -103,7 +104,7 @@ def load_config() -> dict:
     cfg["DEMO"] = not (cfg["MONITORING_URL"] and cfg["MONITORING_HMAC_SECRET"])
     if cfg["DEMO"]:
         cfg["MONITORING_HMAC_SECRET"] = DEMO_SECRET
-    cfg["ADMIN_PASSWORD"] = cfg["ADMIN_PASSWORD"] or "admin"
+    cfg["ADMIN_PASSWORD"] = cfg["ADMIN_PASSWORD"] or ADMIN_PASSWORD
     return cfg
 
 
@@ -398,8 +399,8 @@ def admin_panel(cfg):
             time.sleep(1)
             st.error("Невірний пароль")
         return
-    if cfg["ADMIN_PASSWORD"] == "admin":
-        st.warning("Використовується пароль за замовчуванням — задайте ADMIN_PASSWORD у secrets.")
+    if cfg["ADMIN_PASSWORD"] == ADMIN_PASSWORD:
+        st.warning("Пароль вшито в код — для безпеки задайте ADMIN_PASSWORD у secrets.")
     t1, t2, t3, t4 = st.tabs(["📡 Моніторинг", "👥 Споживачі", "📨 Журнал сповіщень", "🧪 Симулятор"])
 
     with t1:
