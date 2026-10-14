@@ -1865,7 +1865,11 @@ def projects_page():
     st.divider()
     pick = st.selectbox("Переглянути вбудовано", [n for n, _ in PROJECT_LINKS])
     url = dict(PROJECT_LINKS)[pick]
-    st.components.v1.iframe(url + ("&" if "?" in url else "?") + "embed=true", height=720, scrolling=True)
+    src = url + ("&" if "?" in url else "?") + "embed=true"
+    if hasattr(st, "iframe"):  # нові версії Streamlit
+        st.iframe(src, height=720)
+    else:
+        st.components.v1.iframe(src, height=720, scrolling=True)
     st.caption("Якщо застосунок не відображається у рамці — відкрийте його кнопкою вище.")
 
 
