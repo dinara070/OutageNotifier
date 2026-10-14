@@ -248,6 +248,8 @@ def init_db():
         CREATE TABLE IF NOT EXISTS interruptions(
             id INTEGER PRIMARY KEY, incident_id TEXT, node_id TEXT, kind TEXT, start_ts TEXT,
             end_ts TEXT, cause TEXT, synthetic INT DEFAULT 0);
+        CREATE TABLE IF NOT EXISTS meter_readings(
+            id INTEGER PRIMARY KEY, ts TEXT, consumer_id INT, kwh REAL, note TEXT);
         CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
         CREATE TABLE IF NOT EXISTS telemetry_latest(
             tp_id TEXT PRIMARY KEY, ts TEXT, voltage REAL, power_kw REAL, source TEXT,
@@ -260,6 +262,11 @@ def init_db():
         CREATE TABLE IF NOT EXISTS poll_log(
             id INTEGER PRIMARY KEY, ts TEXT, ok INT, message TEXT);
         """)
+        have = {r[1] for r in c.execute("PRAGMA table_info(consumers)")}
+        for col, ddl in (("notify_outage", "INTEGER DEFAULT 1"), ("notify_planned", "INTEGER DEFAULT 1"),
+                         ("remind_hours", "INTEGER DEFAULT 0")):
+            if col not in have:  # міграція існуючої бази
+                c.execute(f"ALTER TABLE consumers ADD COLUMN {col} {ddl}")
 
 
 def hash_pin(pin: str, salt: str) -> str:
@@ -396,32 +403,68 @@ def send_telegram(cfg, chat, subj, body) -> str:
     return "надіслано"
 
 
+def pref(c, key: str, default: int = 1) -> int:
+    try:
+        v = c[key]
+    except (IndexError, KeyError):
+        v = None
+    return default if v is None else v
+
+
+def deliver(cfg, con, c, inc_id: str, subj: str, body: str, event_key: str) -> int:
+    """Доставка по каналах споживача; дедуплікація через UNIQUE у notif_log. Повертає к-сть нових відправлень."""
+    sent = 0
+    channels = [("email", c["ch_email"], lambda: send_email(cfg, c["email"], subj, body)),
+                ("sms", c["ch_sms"], lambda: f"імітація SMS на {c['phone']}: {subj}"),
+                ("telegram", c["ch_tg"], lambda: send_telegram(cfg, c["telegram_chat"], subj, body))]
+    for name, enabled, fn in channels:
+        if not enabled:
+            continue
+        try:
+            con.execute("INSERT INTO notif_log(ts,incident_id,consumer_id,channel,event_key,status,detail)"
+                        " VALUES(?,?,?,?,?,?,?)", (now_iso(), inc_id, c["id"], name, event_key, "pending", ""))
+        except sqlite3.IntegrityError:
+            continue  # уже надсилали
+        try:
+            status, detail = "ok", fn()
+        except Exception as e:  # помилка каналу не зупиняє решту
+            status, detail = "error", str(e)[:200]
+        con.execute("UPDATE notif_log SET status=?, detail=? WHERE incident_id=? AND consumer_id=? "
+                    "AND channel=? AND event_key=?", (status, detail, inc_id, c["id"], name, event_key))
+        sent += 1
+    return sent
+
+
 def notify_for(cfg, inc: dict):
-    """Сповістити всіх споживачів лінії; дедуплікація через UNIQUE у notif_log."""
+    """Сповістити всіх споживачів нижче вузла події з урахуванням їхніх уподобань (аварії / планові)."""
     event_key = f"{inc['status']}:{inc['updated_at']}"
     consumers = consumers_under(inc["line_id"])  # каскад: усі споживачі нижче вузла аварії
     with DB_LOCK, db() as con:
         for c in consumers:
+            if not pref(c, "notify_outage" if inc["kind"] == "outage" else "notify_planned"):
+                continue
             subj, body = build_message(inc, c)
-            channels = [("email", c["ch_email"], lambda: send_email(cfg, c["email"], subj, body)),
-                        ("sms", c["ch_sms"], lambda: f"імітація SMS на {c['phone']}: {subj}"),
-                        ("telegram", c["ch_tg"], lambda: send_telegram(cfg, c["telegram_chat"], subj, body))]
-            for name, enabled, fn in channels:
-                if not enabled:
+            deliver(cfg, con, c, inc["id"], subj, body, event_key)
+
+
+def send_reminders(cfg) -> int:
+    """Нагадування про планові роботи за N годин до початку (N задає споживач у профілі)."""
+    cons = [c for c in q("SELECT * FROM consumers") if pref(c, "remind_hours", 0) > 0 and pref(c, "notify_planned")]
+    plan = q("SELECT * FROM incidents WHERE kind='planned' AND status='scheduled'") if cons else []
+    now, sent = datetime.now(timezone.utc), 0
+    with DB_LOCK, db() as con:
+        for c in cons:
+            ids, hrs = chain_ids(c), pref(c, "remind_hours", 0)
+            for inc in plan:
+                a = pdt(inc["starts_at"])
+                if inc["line_id"] not in ids or not a or not timedelta(0) < a - now <= timedelta(hours=hrs):
                     continue
-                try:
-                    con.execute("INSERT INTO notif_log(ts,incident_id,consumer_id,channel,event_key,status,detail)"
-                                " VALUES(?,?,?,?,?,?,?)",
-                                (now_iso(), inc["id"], c["id"], name, event_key, "pending", ""))
-                except sqlite3.IntegrityError:
-                    continue  # уже надсилали
-                try:
-                    status, detail = "ok", fn()
-                except Exception as e:  # помилка каналу не зупиняє решту
-                    status, detail = "error", str(e)[:200]
-                con.execute("UPDATE notif_log SET status=?, detail=? WHERE incident_id=? AND consumer_id=? "
-                            "AND channel=? AND event_key=?",
-                            (status, detail, inc["id"], c["id"], name, event_key))
+                subj = f"⏰ Нагадування: {inc['title']}"
+                body = (f"Шановний(а) {c['name']}!\n\nЗа вашою адресою ({c['address']}) заплановано відключення "
+                        f"електропостачання через {until(inc['starts_at'])}.\nПочаток: {fmt_dt(inc['starts_at'])}\n"
+                        f"Орієнтовне завершення: {fmt_dt(inc['ends_at'])}\n{inc['description'] or ''}")
+                sent += deliver(cfg, con, c, inc["id"], subj, body, f"reminder:{inc['updated_at']}:{hrs}")
+    return sent
 
 
 def poll_once(cfg) -> str:
@@ -461,6 +504,10 @@ def start_poller(cfg_items: tuple):
                 with DB_LOCK, db() as con:
                     con.execute("INSERT INTO poll_log(ts,ok,message) VALUES(?,?,?)",
                                 (now_iso(), 0, f"Автовиявлення: {e}"))
+            try:
+                send_reminders(cfg)
+            except Exception:
+                pass
             time.sleep(max(5, cfg["POLL_INTERVAL_SEC"]))
 
     t = threading.Thread(target=loop, daemon=True, name="poller")
@@ -525,6 +572,396 @@ def test_channels(cfg, c) -> list[str]:
     return out or ["Жоден канал не увімкнено."]
 
 
+def ics_escape(t) -> str:
+    return str(t).replace("\\", "\\\\").replace(";", "\\;").replace(",", "\\,").replace("\n", "\\n")
+
+
+def make_ics(rows, c) -> bytes:
+    """iCalendar (.ics) із запланованими роботами для додавання в календар."""
+    lines = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Vinnytsia Outage Notifier//UK", "CALSCALE:GREGORIAN",
+             "METHOD:PUBLISH"]
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    for r in rows:
+        a = pdt(r["starts_at"])
+        if not a:
+            continue
+        b = pdt(r["ends_at"]) or a + timedelta(hours=4)
+        fmt = lambda d: d.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        lines += ["BEGIN:VEVENT", f"UID:{r['id']}-{c['account']}@outage-notifier", f"DTSTAMP:{stamp}",
+                  f"DTSTART:{fmt(a)}", f"DTEND:{fmt(b)}", f"SUMMARY:{ics_escape('⚡ ' + r['title'])}",
+                  f"DESCRIPTION:{ics_escape(r['description'] or 'Планове відключення електропостачання')}",
+                  f"LOCATION:{ics_escape(c['address'])}", "BEGIN:VALARM", "ACTION:DISPLAY",
+                  "DESCRIPTION:Планове відключення", "TRIGGER:-PT2H", "END:VALARM", "END:VEVENT"]
+    lines.append("END:VCALENDAR")
+    return ("\r\n".join(lines) + "\r\n").encode("utf-8")
+
+
+def submit_report(c, cfg, cat: str, txt: str) -> tuple:
+    """Звернення споживача (ліміт 5/год) + миттєва перевірка автовиявлення аварій."""
+    recent = q("SELECT COUNT(*) AS n FROM reports WHERE consumer_id=? AND ts>?",
+               (c["id"], iso_utc(datetime.now(timezone.utc) - timedelta(hours=1))))[0]["n"]
+    if len(txt.strip()) < 5:
+        return False, "Опишіть проблему (мінімум 5 символів)"
+    if recent >= 5:
+        return False, "Ліміт: не більше 5 звернень на годину"
+    with DB_LOCK, db() as con:
+        con.execute("INSERT INTO reports(ts,consumer_id,line_id,category,text) VALUES(?,?,?,?,?)",
+                    (now_iso(), c["id"], c["line_id"], cat, txt.strip()))
+    try:
+        auto_detect(cfg)  # можливий кластер скарг → автоінцидент
+    except Exception:
+        pass
+    return True, "Звернення надіслано"
+
+
+def seed_meter(consumer_id: int, months: int = 7) -> int:
+    """Демо-історія показань лічильника (щомісяця, взимку споживання вище)."""
+    if q("SELECT COUNT(*) AS n FROM meter_readings WHERE consumer_id=?", (consumer_id,))[0]["n"]:
+        return 0
+    rng, now = random.Random(consumer_id), datetime.now(timezone.utc)
+    kwh, recs = 12000 + rng.randint(0, 3000), []
+    for i in range(months, -1, -1):
+        d = now - timedelta(days=30 * i, hours=1)
+        recs.append((iso_utc(d), consumer_id, round(kwh, 1), None))
+        kwh += rng.uniform(220, 330) * (1.35 if d.month in (11, 12, 1, 2) else 1.0)
+    with DB_LOCK, db() as con:
+        con.executemany("INSERT INTO meter_readings(ts,consumer_id,kwh,note) VALUES(?,?,?,?)", recs)
+    return len(recs)
+
+
+def chain_map(c, res) -> pdk.Deck:
+    tp = tp_of(c["account"], c["line_id"])
+    ids = ancestors(tp)  # [ТП, фідер, підстанція]
+    me = dict(lat=GRID[tp]["lat"] + 0.002, lon=GRID[tp]["lon"] + 0.003)
+    col = lambda i: COLORS[3] if res[i]["dark"] else COLORS[2] if res[i]["level"] == 2 else [46, 160, 67, 210]
+    edges = [dict(slon=GRID[GRID[i]["parent"]]["lon"], slat=GRID[GRID[i]["parent"]]["lat"], dlon=GRID[i]["lon"],
+                  dlat=GRID[i]["lat"], color=col(i)) for i in ids if GRID[i]["parent"]]
+    edges.append(dict(slon=GRID[tp]["lon"], slat=GRID[tp]["lat"], dlon=me["lon"], dlat=me["lat"], color=col(tp)))
+    size = {"sub": 900, "feeder": 600, "tp": 450}
+    nodes = pd.DataFrame([dict(lon=GRID[i]["lon"], lat=GRID[i]["lat"], color=COLORS[res[i]["level"]], r=size[GRID[i]["type"]],
+                               tip=f"<b>{GRID[i]['name']}</b><br/>{state_text(res[i])}") for i in ids])
+    code = node_code(tp)
+    near = pd.DataFrame([dict(lon=g["lon"], lat=g["lat"], color=COLORS[res[i]["level"]][:3] + [130],
+                              tip=f"{g['name']}<br/>{LEVELS[res[i]['level']]}")
+                         for i, g in GRID.items() if g["type"] == "tp" and node_code(i) == code and i != tp])
+    mine = pd.DataFrame([dict(lon=me["lon"], lat=me["lat"], color=[31, 119, 180, 255],
+                              tip=f"<b>Ваша адреса</b><br/>{_html.escape(str(c['address']))}")])
+    pts = [GRID[i] for i in ids] + [me]
+    lat_s = max(p["lat"] for p in pts) - min(p["lat"] for p in pts)
+    lon_s = max(p["lon"] for p in pts) - min(p["lon"] for p in pts)
+    zoom = min(max(math.log2(1260 / (max(lat_s, lon_s * 0.65, 0.02) * 1.8)), 7), 13)
+    sc = lambda d, **kw: pdk.Layer("ScatterplotLayer", data=d, pickable=True, get_position="[lon, lat]",
+                                   get_fill_color="color", **kw)
+    return pdk.Deck(
+        layers=[pdk.Layer("LineLayer", data=pd.DataFrame(edges), get_source_position="[slon, slat]",
+                          get_target_position="[dlon, dlat]", get_color="color", get_width=4, width_min_pixels=3),
+                sc(near, get_radius=250, radius_min_pixels=4, radius_max_pixels=8),
+                sc(nodes, get_radius="r", radius_min_pixels=9, radius_max_pixels=20, stroked=True,
+                   get_line_color=[255, 255, 255], line_width_min_pixels=2),
+                sc(mine, get_radius=300, radius_min_pixels=8, radius_max_pixels=14, stroked=True,
+                   get_line_color=[255, 255, 255], line_width_min_pixels=2)],
+        map_style="light", tooltip={"html": "{tip}"},
+        initial_view_state=pdk.ViewState(latitude=(max(p["lat"] for p in pts) + min(p["lat"] for p in pts)) / 2,
+                                         longitude=(max(p["lon"] for p in pts) + min(p["lon"] for p in pts)) / 2,
+                                         zoom=zoom, pitch=0))
+
+
+def cab_status(c, cfg, chain, ph, tp):
+    @st.fragment(run_every=5)
+    def live():
+        ev = q(f"SELECT * FROM incidents WHERE line_id IN ({ph}) AND status!='resolved' "
+               "ORDER BY (kind='outage') DESC, updated_at DESC", tuple(chain))
+        active = [r for r in ev if r["status"] == "active"]
+        plan = [r for r in ev if r["status"] == "scheduled"]
+        k1, k2, k3 = st.columns(3)
+        k1.metric("Стан лінії", "🔴 Аварія" if any(r["kind"] == "outage" for r in active)
+                  else "🟠 Ремонт" if active else "🟢 Норма")
+        k2.metric("Активні події", len(active))
+        k3.metric("Найближчі роботи", until(min(r["starts_at"] for r in plan)) if plan else "—")
+        eta = [r for r in active if r["ends_at"]]
+        if eta:
+            st.info("⏱️ Орієнтовне відновлення: " + "; ".join(f"{fmt_dt(r['ends_at'])} (через {until(r['ends_at'])})"
+                                                           for r in eta[:3]))
+        if c["line_id"] in GRID:
+            tr = q("SELECT * FROM telemetry_latest WHERE tp_id=?", (tp,))
+            if tr:
+                stt = tele_status(tr[0], datetime.now(timezone.utc), float(get_setting("tele_loss_v")),
+                                  int(get_setting("tele_stale_min")))
+                msg = (f"📟 Дані з вашої ТП: напруга **{tr[0]['voltage']:.0f} В**, навантаження ТП "
+                       f"**{tr[0]['power_kw']:.0f} кВт** · {TELE_LABELS[stt]} · {fmt_dt(tr[0]['ts'])}")
+                (st.error if stt == "dark" else st.warning if stt in ("low", "high", "spike") else st.success)(msg)
+        incident_cards(ev)
+        st.caption(f"Оновлено {datetime.now().strftime('%H:%M:%S')} · автооновлення кожні 5 с")
+
+    live()
+    covered = q(f"SELECT 1 FROM incidents WHERE line_id IN ({ph}) AND status='active' LIMIT 1", tuple(chain))
+    if st.button("🔌 Повідомити: немає світла", key="quick_report"):
+        if covered:
+            st.info("На вашій ділянці мережі вже зафіксовано подію — ми знаємо про проблему.")
+        else:
+            ok, msg = submit_report(c, cfg, REPORT_CATEGORIES[0], "Швидке звернення з кабінету: немає електропостачання")
+            (st.success if ok else st.error)(msg)
+
+
+def cab_network(c, tp):
+    res = grid_states()
+    st.pydeck_chart(chain_map(c, res), use_container_width=True)
+    st.caption("🔵 ваша адреса · лінії й вузли: 🟢 норма · 🟠 планові роботи · 🔴 аварія. Дрібні точки — інші ТП вашого населеного пункту.")
+    ids = ancestors(tp)
+    st.dataframe(pd.DataFrame([{"Вузол": NODE_TYPES[GRID[i]["type"]], "Назва": GRID[i]["name"],
+                                "Стан": LEVELS[res[i]["level"]] + (" · знеструмлено" if res[i]["dark"] else ""),
+                                "Причина": (res[i]["cause"] or "—") + (" (каскад)" if res[i]["inherited"] else "")}
+                               for i in ids]), use_container_width=True, hide_index=True)
+    st.markdown("**Напруга і навантаження вашої ТП (3 год)**")
+    h = qdf("SELECT ts, voltage, power_kw FROM telemetry_log WHERE tp_id=? AND ts>? ORDER BY ts",
+            (tp, iso_utc(datetime.now(timezone.utc) - timedelta(hours=3))))
+    if h.empty:
+        st.info("Телеметрії вашої ТП поки немає.")
+    elif px is None:
+        st.line_chart(h.set_index("ts")[["voltage"]])
+    else:
+        h["ts"] = pd.to_datetime(h["ts"], utc=True).dt.tz_convert(None)
+        fig = make_subplots(specs=[[{"secondary_y": True}]])
+        fig.add_scatter(x=h["ts"], y=h["voltage"], name="Напруга, В", line=dict(color="#1f77b4"))
+        fig.add_scatter(x=h["ts"], y=h["power_kw"], name="Навантаження ТП, кВт", line=dict(color="#e57300"), secondary_y=True)
+        fig.add_hrect(y0=207, y1=253, fillcolor="green", opacity=0.07, line_width=0)
+        fig.update_layout(template="plotly_white", height=300, margin=dict(t=20, b=20), legend=dict(orientation="h", y=1.15))
+        st.plotly_chart(fig, use_container_width=True)
+        st.caption("Зелена смуга — допустима напруга (230 В ±10 %). Показники — рівня ТП, а не вашого лічильника.")
+
+
+def cab_schedule(c, ph, chain, code):
+    plan = q(f"SELECT * FROM incidents WHERE line_id IN ({ph}) AND kind='planned' AND status='scheduled' "
+             "ORDER BY starts_at", tuple(chain))
+    st.markdown("**Заплановані роботи на вашій лінії**")
+    if plan:
+        st.dataframe(pd.DataFrame([{"Робота": r["title"], "Початок": fmt_dt(r["starts_at"]),
+                                    "Завершення": fmt_dt(r["ends_at"]),
+                                    "Тривалість": span(r["starts_at"], r["ends_at"]),
+                                    "Через": until(r["starts_at"])} for r in plan]),
+                     use_container_width=True, hide_index=True)
+        st.download_button("📆 Додати в календар (.ics)", make_ics(plan, c), "planned_outages.ics", "text/calendar")
+        rem = pref(c, "remind_hours", 0)
+        st.caption(f"Нагадування за {rem} год до початку увімкнено." if rem else
+                   "Налаштуйте автоматичні нагадування у вкладці «Профіль».")
+    else:
+        st.success("Планових відключень не заплановано.")
+    if code:
+        others = [l for l in LINES if LINES[l] == code and l != c["line_id"]]
+        near = q(f"SELECT * FROM incidents WHERE status!='resolved' AND line_id IN ({','.join('?' * len(others))})", others)
+        st.markdown(f"**Інші лінії: {SETTLEMENTS[code][0]}**")
+        if near:
+            st.dataframe(pd.DataFrame([{"Лінія": r["line_id"], "Тип": KINDS[r["kind"]], "Подія": r["title"],
+                                        "Статус": STATUSES[r["status"]]} for r in near]),
+                         use_container_width=True, hide_index=True)
+        else:
+            st.caption("На інших лініях вашого населеного пункту подій немає.")
+
+
+def cab_history(ph, chain):
+    hist = q(f"SELECT * FROM incidents WHERE line_id IN ({ph}) ORDER BY updated_at DESC", tuple(chain))
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Усього подій", len(hist))
+    m2.metric("Аварій", sum(r["kind"] == "outage" for r in hist))
+    m3.metric("Планових робіт", sum(r["kind"] == "planned" for r in hist))
+    f1, f2 = st.columns(2)
+    kinds = f1.multiselect("Тип", list(KINDS), default=list(KINDS), format_func=KINDS.get)
+    sts = f2.multiselect("Статус", list(STATUSES), default=list(STATUSES), format_func=STATUSES.get)
+    data = [{"Подія": r["title"], "Тип": KINDS[r["kind"]], "Статус": STATUSES[r["status"]],
+             "Початок": fmt_dt(r["starts_at"]), "Завершення": fmt_dt(r["ends_at"]),
+             "Тривалість": span(r["starts_at"], r["updated_at"] if r["status"] == "resolved" else r["ends_at"]),
+             "Оновлено": fmt_dt(r["updated_at"])} for r in hist if r["kind"] in kinds and r["status"] in sts]
+    if data:
+        df = pd.DataFrame(data)
+        st.dataframe(df, use_container_width=True, hide_index=True)
+        st.download_button("⬇️ Завантажити CSV", df.to_csv(index=False).encode("utf-8-sig"), "history.csv", "text/csv")
+    else:
+        st.info("Подій за обраними фільтрами немає.")
+
+
+def cab_reliability(tp):
+    days = st.radio("Період, діб", [30, 90], horizontal=True, key="cab_rel_days")
+    now = datetime.now(timezone.utc)
+    df = interruption_frame(now - timedelta(days=days), now + timedelta(minutes=1), ("outage", "planned"), 3)
+    avg = kpis(df, customers_total(), days)
+    mine = df[df["tp"] == tp].drop_duplicates("int_id")
+    n_ev, minutes = len(mine), float(mine["dur"].sum())
+    k = st.columns(4)
+    k[0].metric("Відключень", n_ev, f"{n_ev - avg['saifi']:+.1f} до середнього по області", delta_color="inverse")
+    k[1].metric("Сумарно без світла", f"{minutes / 60:.1f} год", f"{(minutes - avg['saidi']) / 60:+.1f} год до середнього",
+                delta_color="inverse")
+    k[2].metric("Середній час відновлення", f"{minutes / n_ev:.0f} хв" if n_ev else "—",
+                f"{(minutes / n_ev - avg['caidi']):+.0f} хв до середнього" if n_ev and avg["caidi"] else None,
+                delta_color="inverse")
+    k[3].metric("Доступність", f"{100 * (1 - minutes / (days * 1440)):.3f} %")
+    per_tp = df.drop_duplicates(["int_id", "tp"]).groupby("tp")["dur"].sum().reindex(GRID_TPS, fill_value=0)
+    better = float((per_tp > minutes).mean() * 100)
+    st.caption(f"Середнє по області: SAIFI {avg['saifi']:.2f}, SAIDI {avg['saidi'] / 60:.1f} год, CAIDI {avg['caidi']:.0f} хв. "
+               f"За простоями ваша ТП краща, ніж {better:.0f}% ТП області за {days} діб.")
+    if mine.empty:
+        st.success("За вибраний період відключень на вашій ТП не було 🎉")
+        return
+    tl = mine.assign(Тип=mine["kind"].map(KIND_LABELS), Хвилин=mine["dur"].round(0),
+                     Початок=mine["start"].dt.tz_convert(None), Причина=mine["cause"])
+    if px is not None:
+        fig = px.bar(tl, x="Початок", y="Хвилин", color="Тип", template="plotly_white", hover_data=["Причина"],
+                     color_discrete_map={"Аварійне": "#e53935", "Планове": "#fb8c00"},
+                     labels={"Хвилин": "Тривалість, хв"}, title="Відключення на вашій ТП")
+        fig.update_layout(height=320, margin=dict(t=50, b=20), legend=dict(orientation="h", y=-0.25))
+        st.plotly_chart(fig, use_container_width=True)
+    tl["Початок"] = tl["Початок"].dt.strftime("%d.%m.%Y %H:%M")
+    st.dataframe(tl[["Початок", "Тип", "Хвилин", "Причина"]].sort_values("Початок", ascending=False),
+                 use_container_width=True, hide_index=True)
+
+
+def cab_meter(c, cfg):
+    rows = q("SELECT * FROM meter_readings WHERE consumer_id=? ORDER BY ts", (c["id"],))
+    last = float(rows[-1]["kwh"]) if rows else 0.0
+    with st.form("meter", clear_on_submit=True):
+        kwh = st.number_input("Показання лічильника, кВт·год", min_value=0.0, value=last, step=1.0, format="%.1f")
+        note = st.text_input("Примітка (необов'язково)", max_chars=100)
+        if st.form_submit_button("Передати показання"):
+            today = q("SELECT COUNT(*) AS n FROM meter_readings WHERE consumer_id=? AND ts>?",
+                      (c["id"], iso_utc(datetime.now(timezone.utc) - timedelta(days=1))))[0]["n"]
+            if rows and kwh < last:
+                st.error("Показання не можуть бути меншими за попереднє")
+            elif rows and kwh == last:
+                st.error("Показання не змінилося з моменту останньої передачі")
+            elif rows and kwh - last > 5000:
+                st.error("Підозріло велике споживання (понад 5000 кВт·год) — перевірте значення")
+            elif today >= 3:
+                st.error("Ліміт: не більше 3 передач на добу")
+            else:
+                with DB_LOCK, db() as con:
+                    con.execute("INSERT INTO meter_readings(ts,consumer_id,kwh,note) VALUES(?,?,?,?)",
+                                (now_iso(), c["id"], kwh, note.strip() or None))
+                st.toast("Показання прийнято")
+                st.rerun()
+    if not rows:
+        st.info("Показань поки немає.")
+        if cfg["DEMO"] and st.button("🧪 Згенерувати демо-історію показань"):
+            seed_meter(c["id"])
+            st.rerun()
+        return
+    df = pd.DataFrame([{"ts": pdt(r["ts"]), "kwh": r["kwh"], "note": r["note"] or ""} for r in rows])
+    df["used"] = df["kwh"].diff()
+    df["days"] = df["ts"].diff().dt.total_seconds() / 86400
+    df["rate"] = df["used"] / df["days"]
+    recent = df.dropna(subset=["rate"]).tail(3)["rate"]
+    k = st.columns(4)
+    k[0].metric("Останнє показання", f"{last:,.0f} кВт·год".replace(",", " "), fmt_dt(rows[-1]["ts"]), delta_color="off")
+    k[1].metric("За останній період", f"{df['used'].iloc[-1]:.0f} кВт·год" if len(df) > 1 else "—")
+    k[2].metric("Середньодобове", f"{recent.mean():.1f} кВт·год" if len(recent) else "—")
+    k[3].metric("Прогноз на 30 діб", f"{recent.mean() * 30:.0f} кВт·год" if len(recent) else "—")
+    per = df.dropna(subset=["used"])
+    if not per.empty:
+        if px is not None:
+            fig = px.bar(per.assign(Дата=per["ts"].dt.tz_convert(None)), x="Дата", y="used", text_auto=".0f",
+                         template="plotly_white", labels={"used": "Спожито, кВт·год"}, title="Споживання за періодами")
+            fig.update_traces(marker_color="#1f77b4")
+            fig.update_layout(height=320, margin=dict(t=50, b=20))
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.bar_chart(per.set_index("ts")["used"])
+    tbl = pd.DataFrame({"Дата": df["ts"].map(fmt_dt), "Показання": df["kwh"].round(1),
+                        "Спожито, кВт·год": df["used"].round(1), "Діб": df["days"].round(1),
+                        "кВт·год/добу": df["rate"].round(1), "Примітка": df["note"]})
+    st.dataframe(tbl.iloc[::-1], use_container_width=True, hide_index=True)
+    st.download_button("⬇️ Завантажити CSV", tbl.to_csv(index=False).encode("utf-8-sig"), "meter_readings.csv", "text/csv")
+
+
+def cab_notifications(c, cfg):
+    df = qdf("SELECT n.ts AS Час, i.title AS Подія, n.channel AS Канал, n.status AS Статус, "
+             "n.event_key AS Ключ, n.detail AS Деталі FROM notif_log n LEFT JOIN incidents i ON i.id=n.incident_id "
+             "WHERE n.consumer_id=? ORDER BY n.id DESC LIMIT 200", (c["id"],))
+    if df.empty:
+        st.info("Сповіщень поки немає.")
+    else:
+        df["Тип"] = df["Ключ"].map(lambda k: "⏰ Нагадування" if str(k).startswith("reminder") else "🔔 Подія")
+        df["Час"] = df["Час"].map(fmt_dt)
+        chans = st.multiselect("Канал", sorted(df["Канал"].unique()), default=sorted(df["Канал"].unique()))
+        st.dataframe(df[df["Канал"].isin(chans)][["Час", "Тип", "Подія", "Канал", "Статус", "Деталі"]],
+                     use_container_width=True, hide_index=True)
+    if st.button("📨 Надіслати тестове сповіщення"):
+        for line in test_channels(cfg, c):
+            st.write(line)
+
+
+def cab_reports(c, cfg):
+    with st.form("report", clear_on_submit=True):
+        cat = st.selectbox("Тема звернення", REPORT_CATEGORIES)
+        txt = st.text_area("Опишіть проблему", max_chars=1000)
+        if st.form_submit_button("Надіслати диспетчеру"):
+            ok, msg = submit_report(c, cfg, cat, txt)
+            (st.success if ok else st.error)(msg)
+    mine = qdf("SELECT id AS №, ts AS Час, category AS Тема, text AS Опис, status AS Статус "
+               "FROM reports WHERE consumer_id=? ORDER BY id DESC LIMIT 50", (c["id"],))
+    if not mine.empty:
+        mine["Статус"] = mine["Статус"].map(REPORT_STATUS)
+        mine["Час"] = mine["Час"].map(fmt_dt)
+        st.dataframe(mine, use_container_width=True, hide_index=True)
+
+
+def cab_profile(c):
+    with st.form("profile"):
+        a, b = st.columns(2)
+        email = a.text_input("Email", c["email"] or "")
+        phone = b.text_input("Телефон", c["phone"] or "")
+        tg = a.text_input("Telegram chat_id", c["telegram_chat"] or "")
+        st.write("Канали сповіщень")
+        e = st.checkbox("Email", bool(c["ch_email"]))
+        sm = st.checkbox("SMS", bool(c["ch_sms"]))
+        t = st.checkbox("Telegram", bool(c["ch_tg"]))
+        st.write("Про що сповіщати")
+        p1, p2 = st.columns(2)
+        n_out = p1.checkbox("Аварії", bool(pref(c, "notify_outage")))
+        n_pl = p2.checkbox("Планові роботи", bool(pref(c, "notify_planned")))
+        rem = st.number_input("Нагадувати про планові роботи за N годин до початку (0 — вимкнено)", 0, 72,
+                              min(int(pref(c, "remind_hours", 0)), 72))
+        if st.form_submit_button("Зберегти"):
+            email, phone, tg = email.strip(), phone.strip(), tg.strip()
+            if email and "@" not in email:
+                st.error("Некоректний email")
+            elif (e and not email) or (sm and not phone) or (t and not tg):
+                st.error("Для кожного увімкненого каналу вкажіть контакт")
+            elif not (n_out or n_pl):
+                st.error("Увімкніть хоча б один тип сповіщень")
+            else:
+                with DB_LOCK, db() as con:
+                    con.execute("UPDATE consumers SET email=?,phone=?,telegram_chat=?,ch_email=?,ch_sms=?,ch_tg=?,"
+                                "notify_outage=?,notify_planned=?,remind_hours=? WHERE id=?",
+                                (email, phone, tg, int(e), int(sm), int(t), int(n_out), int(n_pl), int(rem), c["id"]))
+                st.toast("Профіль збережено")
+                st.rerun()
+    with st.expander("🔑 Змінити PIN-код"):
+        with st.form("pin"):
+            old = st.text_input("Поточний PIN", type="password")
+            new = st.text_input("Новий PIN (мін. 4 цифри)", type="password")
+            new2 = st.text_input("Повторіть новий PIN", type="password")
+            if st.form_submit_button("Змінити PIN"):
+                if not hmac.compare_digest(hash_pin(old, c["salt"]), c["pin_hash"]):
+                    time.sleep(1)
+                    st.error("Поточний PIN невірний")
+                elif len(new) < 4 or not new.isdigit():
+                    st.error("Новий PIN: щонайменше 4 цифри")
+                elif new != new2:
+                    st.error("PIN-коди не збігаються")
+                else:
+                    salt = os.urandom(16).hex()
+                    with DB_LOCK, db() as con:
+                        con.execute("UPDATE consumers SET salt=?, pin_hash=? WHERE id=?", (salt, hash_pin(new, salt), c["id"]))
+                    st.success("PIN змінено")
+    with st.expander("📦 Мої дані"):
+        prof = {k: c[k] for k in c.keys() if k not in ("salt", "pin_hash")}
+        data = dict(profile=prof,
+                    reports=[dict(r) for r in q("SELECT ts,category,text,status FROM reports WHERE consumer_id=?", (c["id"],))],
+                    notifications=[dict(r) for r in q("SELECT ts,incident_id,channel,status FROM notif_log WHERE consumer_id=?", (c["id"],))],
+                    meter_readings=[dict(r) for r in q("SELECT ts,kwh,note FROM meter_readings WHERE consumer_id=?", (c["id"],))])
+        st.download_button("⬇️ Завантажити мої дані (JSON)", json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8"),
+                           "my_data.json", "application/json")
+        st.caption("PIN-код у вигляді хешу в експорт не входить.")
+
+
 def consumer_portal():
     cfg = load_config()
     st.subheader("Кабінет споживача")
@@ -552,6 +989,7 @@ def consumer_portal():
     raion = SETTLEMENTS[code][1] if code else "—"
     chain = chain_ids(c)
     ph = ",".join("?" * len(chain))
+    tp = tp_of(c["account"], c["line_id"]) if c["line_id"] in GRID else c["line_id"]
     h1, h2 = st.columns([5, 1])
     h1.markdown(f"#### 👤 {c['name']}")
     h1.caption(f"Рахунок {c['account']} · {c['address']} · {raion} район · лінія {line_label(c['line_id'])}")
@@ -561,153 +999,26 @@ def consumer_portal():
         del st.session_state["consumer_id"]
         st.rerun()
 
-    tabs = st.tabs(["🏠 Поточний стан", "📅 Графік робіт", "🗂️ Історія", "🔔 Сповіщення",
-                    "📝 Звернення", "⚙️ Профіль"])
-
+    tabs = st.tabs(["🏠 Стан", "🗺️ Моя мережа", "📅 Графік робіт", "🗂️ Історія", "📊 Надійність",
+                    "⚡ Лічильник", "🔔 Сповіщення", "📝 Звернення", "⚙️ Профіль"])
     with tabs[0]:
-        @st.fragment(run_every=5)
-        def live():
-            ev = q(f"SELECT * FROM incidents WHERE line_id IN ({ph}) AND status!='resolved' "
-                   "ORDER BY (kind='outage') DESC, updated_at DESC", tuple(chain))
-            active = [r for r in ev if r["status"] == "active"]
-            plan = [r for r in ev if r["status"] == "scheduled"]
-            k1, k2, k3 = st.columns(3)
-            k1.metric("Стан лінії", "🔴 Аварія" if any(r["kind"] == "outage" for r in active)
-                      else "🟠 Ремонт" if active else "🟢 Норма")
-            k2.metric("Активні події", len(active))
-            k3.metric("Найближчі роботи", until(min(r["starts_at"] for r in plan)) if plan else "—")
-            incident_cards(ev)
-            st.caption(f"Оновлено {datetime.now().strftime('%H:%M:%S')} · автооновлення кожні 5 с")
-
-        live()
-
+        cab_status(c, cfg, chain, ph, tp)
     with tabs[1]:
-        plan = q(f"SELECT * FROM incidents WHERE line_id IN ({ph}) AND kind='planned' AND status='scheduled' "
-                 "ORDER BY starts_at", tuple(chain))
-        st.markdown("**Заплановані роботи на вашій лінії**")
-        if plan:
-            st.dataframe(pd.DataFrame([{"Робота": r["title"], "Початок": fmt_dt(r["starts_at"]),
-                                        "Завершення": fmt_dt(r["ends_at"]),
-                                        "Тривалість": span(r["starts_at"], r["ends_at"]),
-                                        "Через": until(r["starts_at"])} for r in plan]),
-                         use_container_width=True, hide_index=True)
-        else:
-            st.success("Планових відключень не заплановано.")
-        if code:
-            others = [l for l in LINES if LINES[l] == code and l != c["line_id"]]
-            near = q(f"SELECT * FROM incidents WHERE status!='resolved' AND line_id IN "
-                     f"({','.join('?' * len(others))})", others)
-            st.markdown(f"**Інші лінії: {SETTLEMENTS[code][0]}**")
-            if near:
-                st.dataframe(pd.DataFrame([{"Лінія": r["line_id"], "Тип": KINDS[r["kind"]],
-                                            "Подія": r["title"], "Статус": STATUSES[r["status"]]}
-                                           for r in near]), use_container_width=True, hide_index=True)
-            else:
-                st.caption("На інших лініях вашого населеного пункту подій немає.")
-
+        cab_network(c, tp)
     with tabs[2]:
-        hist = q(f"SELECT * FROM incidents WHERE line_id IN ({ph}) ORDER BY updated_at DESC", tuple(chain))
-        m1, m2, m3 = st.columns(3)
-        m1.metric("Усього подій", len(hist))
-        m2.metric("Аварій", sum(r["kind"] == "outage" for r in hist))
-        m3.metric("Планових робіт", sum(r["kind"] == "planned" for r in hist))
-        f1, f2 = st.columns(2)
-        kinds = f1.multiselect("Тип", list(KINDS), default=list(KINDS), format_func=KINDS.get)
-        sts = f2.multiselect("Статус", list(STATUSES), default=list(STATUSES), format_func=STATUSES.get)
-        data = [{"Подія": r["title"], "Тип": KINDS[r["kind"]], "Статус": STATUSES[r["status"]],
-                 "Початок": fmt_dt(r["starts_at"]), "Завершення": fmt_dt(r["ends_at"]),
-                 "Тривалість": span(r["starts_at"], r["updated_at"] if r["status"] == "resolved" else r["ends_at"]),
-                 "Оновлено": fmt_dt(r["updated_at"])}
-                for r in hist if r["kind"] in kinds and r["status"] in sts]
-        if data:
-            df = pd.DataFrame(data)
-            st.dataframe(df, use_container_width=True, hide_index=True)
-            st.download_button("⬇️ Завантажити CSV", df.to_csv(index=False).encode("utf-8-sig"),
-                               "history.csv", "text/csv")
-        else:
-            st.info("Подій за обраними фільтрами немає.")
-
+        cab_schedule(c, ph, chain, code)
     with tabs[3]:
-        df = qdf("SELECT n.ts AS Час, i.title AS Подія, n.channel AS Канал, n.status AS Статус, "
-                 "n.detail AS Деталі FROM notif_log n LEFT JOIN incidents i ON i.id=n.incident_id "
-                 "WHERE n.consumer_id=? ORDER BY n.id DESC LIMIT 200", (c["id"],))
-        if df.empty:
-            st.info("Сповіщень поки немає.")
-        else:
-            chans = st.multiselect("Канал", sorted(df["Канал"].unique()), default=sorted(df["Канал"].unique()))
-            st.dataframe(df[df["Канал"].isin(chans)], use_container_width=True, hide_index=True)
-        if st.button("📨 Надіслати тестове сповіщення"):
-            for line in test_channels(cfg, c):
-                st.write(line)
-
+        cab_history(ph, chain)
     with tabs[4]:
-        with st.form("report", clear_on_submit=True):
-            cat = st.selectbox("Тема звернення", REPORT_CATEGORIES)
-            txt = st.text_area("Опишіть проблему", max_chars=1000)
-            if st.form_submit_button("Надіслати диспетчеру"):
-                recent = q("SELECT COUNT(*) AS n FROM reports WHERE consumer_id=? AND ts>?",
-                           (c["id"], (datetime.now(timezone.utc) - timedelta(hours=1)).replace(microsecond=0).isoformat()))[0]["n"]
-                if len(txt.strip()) < 5:
-                    st.error("Опишіть проблему (мінімум 5 символів)")
-                elif recent >= 5:
-                    st.error("Ліміт: не більше 5 звернень на годину")
-                else:
-                    with DB_LOCK, db() as con:
-                        con.execute("INSERT INTO reports(ts,consumer_id,line_id,category,text) VALUES(?,?,?,?,?)",
-                                    (now_iso(), c["id"], c["line_id"], cat, txt.strip()))
-                    try:
-                        auto_detect(cfg)  # можливий кластер скарг → автоінцидент
-                    except Exception:
-                        pass
-                    st.success("Звернення надіслано")
-        mine = qdf("SELECT id AS №, ts AS Час, category AS Тема, text AS Опис, status AS Статус "
-                   "FROM reports WHERE consumer_id=? ORDER BY id DESC LIMIT 50", (c["id"],))
-        if not mine.empty:
-            mine["Статус"] = mine["Статус"].map(REPORT_STATUS)
-            mine["Час"] = mine["Час"].map(fmt_dt)
-            st.dataframe(mine, use_container_width=True, hide_index=True)
-
+        cab_reliability(tp)
     with tabs[5]:
-        with st.form("profile"):
-            a, b = st.columns(2)
-            email = a.text_input("Email", c["email"] or "")
-            phone = b.text_input("Телефон", c["phone"] or "")
-            tg = a.text_input("Telegram chat_id", c["telegram_chat"] or "")
-            st.write("Канали сповіщень")
-            e = st.checkbox("Email", bool(c["ch_email"]))
-            sm = st.checkbox("SMS", bool(c["ch_sms"]))
-            t = st.checkbox("Telegram", bool(c["ch_tg"]))
-            if st.form_submit_button("Зберегти"):
-                email, phone, tg = email.strip(), phone.strip(), tg.strip()
-                if email and "@" not in email:
-                    st.error("Некоректний email")
-                elif (e and not email) or (sm and not phone) or (t and not tg):
-                    st.error("Для кожного увімкненого каналу вкажіть контакт")
-                else:
-                    with DB_LOCK, db() as con:
-                        con.execute("UPDATE consumers SET email=?,phone=?,telegram_chat=?,ch_email=?,ch_sms=?,"
-                                    "ch_tg=? WHERE id=?", (email, phone, tg, int(e), int(sm), int(t), c["id"]))
-                    st.toast("Профіль збережено")
-                    st.rerun()
-        with st.expander("🔑 Змінити PIN-код"):
-            with st.form("pin"):
-                old = st.text_input("Поточний PIN", type="password")
-                new = st.text_input("Новий PIN (мін. 4 цифри)", type="password")
-                new2 = st.text_input("Повторіть новий PIN", type="password")
-                if st.form_submit_button("Змінити PIN"):
-                    if not hmac.compare_digest(hash_pin(old, c["salt"]), c["pin_hash"]):
-                        time.sleep(1)
-                        st.error("Поточний PIN невірний")
-                    elif len(new) < 4 or not new.isdigit():
-                        st.error("Новий PIN: щонайменше 4 цифри")
-                    elif new != new2:
-                        st.error("PIN-коди не збігаються")
-                    else:
-                        salt = os.urandom(16).hex()
-                        with DB_LOCK, db() as con:
-                            con.execute("UPDATE consumers SET salt=?, pin_hash=? WHERE id=?",
-                                        (salt, hash_pin(new, salt), c["id"]))
-                        st.success("PIN змінено")
+        cab_meter(c, cfg)
+    with tabs[6]:
+        cab_notifications(c, cfg)
+    with tabs[7]:
+        cab_reports(c, cfg)
+    with tabs[8]:
+        cab_profile(c)
 
 
 def admin_panel(cfg):
@@ -1885,6 +2196,10 @@ def main():
                         "'+380501112233')", (salt, hash_pin("1234", salt)))
     if cfg["DEMO"] and q("SELECT COUNT(*) AS n FROM interruptions")[0]["n"] == 0:
         seed_history()
+    if cfg["DEMO"]:
+        demo = q("SELECT id FROM consumers WHERE account='1001'")
+        if demo:
+            seed_meter(demo[0]["id"])
     start_poller(tuple(sorted(cfg.items())))
     start_iot(tuple(sorted(cfg.items())))
 
